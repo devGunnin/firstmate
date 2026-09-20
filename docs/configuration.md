@@ -776,6 +776,9 @@ Steady-state off is silent and writes nothing.
 
 Because the file is shared, a transition to it is reported as a `WATCH_CADENCE:` line naming the plane that asked for the interval and what the watcher sweeps at as a result, not as the `FMX:` line that belongs to Relay's own poll artifacts.
 A home that never opted into Relay is therefore never told Relay removed or failed to remove something, and a cadence write that fails names the plane left polling at the default 300 seconds.
+Every transition is reported the same way - a plane opting in, a later edit of its configured interval, and the wind-down when the last one is turned off - and each carries the supervision-repair pointer, because a watcher already running keeps sweeping at its start-time interval until it is restarted.
+Re-confirming an unchanged interval is not a transition and says nothing, so a home in steady state hears about the cadence only when it actually moves.
+The one exception is a home where Relay itself arms: its own `FMX: X mode on` line already names the interval that resulted, so the cadence is reported there rather than twice.
 
 ## Relay (.env)
 
