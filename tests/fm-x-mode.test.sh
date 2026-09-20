@@ -1019,13 +1019,41 @@ test_bootstrap_names_the_unsettled_cadence_plane_when_relay_arming_fails() {
   pass "bootstrap names the plane whose cadence a failed relay arm left unsettled"
 }
 
+# A wind-down of the shared cadence is a cadence transition wherever it is
+# reached, so it must carry its repair pointer and must not reach a home that
+# never held a relay shim as a Relay line.
+test_bootstrap_reports_a_wind_down_from_the_missing_dependency_branch() {
+  local home out path
+  home="$TMP_ROOT/boot-winddown-missing-dep"; mkdir -p "$home/config"
+  path=$(fm_test_base_path_sans "$BASE_PATH" curl)
+  printf 'FMX_PAIRING_TOKEN=tok-winddown\n' > "$home/.env"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  PATH="$path" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
+  assert_present "$home/config/x-mode.env" \
+    "the mention plane's cadence is written despite the missing relay dependency"
+  assert_absent "$home/state/x-watch.check.sh" "no relay shim is ever armed on this home"
+
+  # The captain pauses the mention plane, so nobody asks for a fast sweep.
+  printf '%s\n' '{"enabled":false,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  out=$(PATH="$path" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_absent "$home/config/x-mode.env" "the shared cadence goes once nobody asks for it"
+  assert_contains "$out" "WATCH_CADENCE: no enabled plane asks for a fast watcher sweep now" \
+    "the wind-down is reported as a cadence transition wherever it is reached"
+  assert_not_contains "$out" "FMX:" \
+    "a home that never armed a relay shim is never told about Relay"
+  pass "bootstrap reports a shared-cadence wind-down from the missing-dependency branch"
+}
+
 test_bootstrap_does_not_announce_when_arm_fails() {
   local home out
   home="$TMP_ROOT/boot-arm-fail"; mkdir -p "$home"
   printf 'FMX_PAIRING_TOKEN=tok-boot\n' > "$home/.env"
   printf '%s\n' 'not a directory' > "$home/config"
   out=$(FM_HOME="$home" FM_CONFIG_OVERRIDE="$home/config" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
-  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim or 30s cadence" \
+  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim" \
     "bootstrap must report a failed X-mode activation"
   assert_not_contains "$out" "FMX: X mode on" \
     "bootstrap must not announce X mode when the shim or cadence was not armed"
@@ -1048,7 +1076,7 @@ test_bootstrap_does_not_follow_x_artifact_symlinks() {
 
   out=$(FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>"$home/bootstrap.err")
 
-  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim or 30s cadence" \
+  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim" \
     "bootstrap must reject linked X-mode destinations"
   assert_not_contains "$out" "FMX: X mode on" \
     "bootstrap must not announce X mode after rejecting linked destinations"
@@ -1185,7 +1213,7 @@ SH
   chmod +x "$fakebin/rm"
   printf 'FMX_PAIRING_TOKEN=\n' > "$home/.env"
   out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
-  assert_contains "$out" "FMX: X mode off - failed to remove relay poll shim or 30s cadence" \
+  assert_contains "$out" "FMX: X mode off - failed to remove relay poll shim" \
     "opt-out cleanup failure must be reported"
   assert_present "$home/state/x-watch.check.sh" "failed opt-out cleanup must leave the stale shim visible"
   assert_present "$home/config/x-mode.env" "failed opt-out cleanup must leave the stale cadence visible"
@@ -3305,6 +3333,7 @@ test_bootstrap_names_the_plane_whose_cadence_it_could_not_settle
 test_bootstrap_reports_a_cadence_settled_while_relay_arming_failed
 test_bootstrap_reports_a_cadence_change_on_a_relay_home
 test_bootstrap_names_the_unsettled_cadence_plane_when_relay_arming_fails
+test_bootstrap_reports_a_wind_down_from_the_missing_dependency_branch
 test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_does_not_follow_x_artifact_symlinks
 test_bootstrap_inert_without_token

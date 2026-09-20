@@ -1092,13 +1092,10 @@ x_mode_setup() {
   cadence_other=$WATCH_CADENCE_WANT
   cadence_other_plane=$WATCH_CADENCE_OWNER
   cadence_before=$(watch_cadence_current "$cadence")
-
-  # The cadence file is the home's, not Relay's, so a transition that belongs to
-  # another plane is reported in that plane's terms and names what the watcher
-  # actually ends up sweeping at. An FMX line routes the captain to Relay.
-  x_mode_report_cadence_unsettled() {
-    echo "WATCH_CADENCE: could not settle config/x-mode.env for $cadence_other_plane, which asked for a ${cadence_other}s sweep; it is polled at the watcher's default interval until that write succeeds"
-  }
+  had_shim=0
+  x_mode_artifact_present "$shim" && had_shim=1
+  had_cadence=0
+  x_mode_artifact_present "$cadence" && had_cadence=1
 
   # A watcher already running keeps its start-time interval, so a cadence that
   # just changed is only real once that watcher is restarted; the pointer is the
@@ -1108,6 +1105,26 @@ x_mode_setup() {
     [ -n "$1" ] || return 0
     [ "$cadence_before" != "$1" ] || return 0
     echo "WATCH_CADENCE: $2 asked for a ${1}s sweep; config/x-mode.env now carries it, so the watcher sweeps every ${1}s from the next supervision cycle; $(x_mode_supervision_repair)"
+  }
+
+  # Every transition of the shared file is reported here and only here, always
+  # naming the plane that asked for the interval. An FMX line speaks for Relay's
+  # own shim and never for this file, because AGENTS.md routes FMX to Relay.
+  x_mode_report_cadence() {  # <settled 0|1>
+    if [ "$1" -eq 0 ]; then
+      if [ -n "$cadence_other" ]; then
+        echo "WATCH_CADENCE: could not settle config/x-mode.env for $cadence_other_plane, which asked for a ${cadence_other}s sweep; it is polled at the watcher's default interval until that write succeeds"
+      elif [ "$had_cadence" -eq 1 ]; then
+        echo "WATCH_CADENCE: no enabled plane asks for a fast watcher sweep now, but config/x-mode.env could not be removed; the watcher keeps sweeping at the stale interval that file names until it is gone"
+      fi
+      return 0
+    fi
+    if [ -n "$cadence_other" ]; then
+      x_mode_report_cadence_set "$cadence_other" "$cadence_other_plane"
+      return 0
+    fi
+    [ "$had_cadence" -eq 1 ] || return 0
+    echo "WATCH_CADENCE: no enabled plane asks for a fast watcher sweep now; removed config/x-mode.env, so checks return to the watcher's default interval on the next supervision cycle; $(x_mode_supervision_repair)"
   }
 
   # Relay releasing the cadence never means the home loses it: another enabled
@@ -1139,24 +1156,12 @@ x_mode_setup() {
     # Opt-out (or never opted in): drop Relay's own shim and settle the shared
     # cadence. Report only what actually changed, so a home that merely keeps
     # the cadence for another plane hears nothing about Relay every session.
-    had_shim=0
-    x_mode_artifact_present "$shim" && had_shim=1
-    had_cadence=0
-    x_mode_artifact_present "$cadence" && had_cadence=1
     if x_mode_remove_artifacts; then
-      x_mode_report_cadence_set "$cadence_other" "$cadence_other_plane"
-      if [ -n "$cadence_other" ]; then
-        [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - removed relay poll shim; the ${cadence_other}s watcher cadence stays for $cadence_other_plane"
-      elif [ "$had_shim" -eq 1 ]; then
-        echo "FMX: X mode off - removed relay poll shim and 30s cadence; default cadence applies on the next supervision cycle; $(x_mode_supervision_repair)"
-      elif [ "$had_cadence" -eq 1 ]; then
-        echo "WATCH_CADENCE: no enabled plane asks for a fast watcher sweep now; removed config/x-mode.env, so checks return to the watcher's default interval on the next supervision cycle; $(x_mode_supervision_repair)"
-      fi
-    elif [ -n "$cadence_other" ]; then
-      x_mode_report_cadence_unsettled
+      x_mode_report_cadence 1
+      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - removed relay poll shim"
+    else
+      x_mode_report_cadence 0
       [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - failed to remove relay poll shim"
-    elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
-      echo "FMX: X mode off - failed to remove relay poll shim or 30s cadence"
     fi
     return 0
   fi
@@ -1172,32 +1177,24 @@ x_mode_setup() {
     # Relay cannot arm, but another plane's cadence request still has to be
     # settled: the cadence is the home's, not Relay's. Report only what was
     # actually there, so a home that never armed Relay hears nothing.
-    had_shim=0
-    x_mode_artifact_present "$shim" && had_shim=1
-    had_cadence=0
-    x_mode_artifact_present "$cadence" && had_cadence=1
     if x_mode_remove_artifacts; then
-      x_mode_report_cadence_set "$cadence_other" "$cadence_other_plane"
-      if [ "$had_shim" -eq 1 ] || { [ -z "$cadence_other" ] && [ "$had_cadence" -eq 1 ]; }; then
-        echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
-      fi
-    elif [ -n "$cadence_other" ]; then
-      x_mode_report_cadence_unsettled
+      x_mode_report_cadence 1
+      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
+    else
+      x_mode_report_cadence 0
       [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - failed to remove relay poll shim after missing relay poll dependencies"
-    elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
-      echo "FMX: X mode off - failed to remove relay poll shim or 30s cadence after missing relay poll dependencies"
     fi
     return 0
   fi
 
   fmx_arm_failed() {
     if x_mode_remove_artifacts; then
-      x_mode_report_cadence_set "$cadence_other" "$cadence_other_plane"
-      echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence"
+      x_mode_report_cadence 1
+      echo "FMX: X mode off - failed to arm relay poll shim"
       return 0
     fi
-    [ -z "$cadence_other" ] || x_mode_report_cadence_unsettled
-    echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence; stale artifacts remain"
+    x_mode_report_cadence 0
+    echo "FMX: X mode off - failed to arm relay poll shim; stale artifacts remain"
   }
 
   watch_cadence_request 30 'the relay poll'
@@ -1219,7 +1216,7 @@ x_mode_setup() {
     || { fmx_arm_failed; return 0; }
 
   x_mode_report_cadence_set "$WATCH_CADENCE_WANT" "$WATCH_CADENCE_OWNER"
-  echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; ${WATCH_CADENCE_WANT}s watcher cadence in config/x-mode.env"
+  echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh"
 }
 
 # GitHub mentions (opt-in): keep this home's mention poll armed exactly while

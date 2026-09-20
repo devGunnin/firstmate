@@ -39,15 +39,25 @@
 # constant per repo rather than growing with repo history:
 #   repos/<o>/<r>/issues/comments  issue and PR conversation comments
 #   repos/<o>/<r>/pulls/comments   PR review comments
-#   repos/<o>/<r>/issues           issue and PR bodies OPENED in the window
+#   repos/<o>/<r>/issues           bodies of threads OPENED recently
 # GitHub filters all three by `since` on updated_at, and a thread's updated_at
 # moves on ANY activity - a new comment, a label, a reopen. For a comment that
 # is what is wanted, because only editing THAT comment moves its own stamp. For
 # a body it is not: an issue tagged months ago and bumped today would be filed
 # as if it were newly asked. So a body qualifies only when its created_at is
-# inside the window; a body edited later is deliberately not picked up here.
-# Tagging a thread that already exists is done by POSTING A COMMENT on it,
-# which the two comment listings above already cover.
+# newer than FM_GH_MENTION_BACKFILL ago.
+#
+# That floor is the POLL'S OWN, never the repo's read cursor: creation and
+# update are two different clocks and the cursor bounds only the second, so
+# testing a creation against it drops a thread that was opened inside the
+# window but cut off from page one of the listing. The wider re-scan costs
+# nothing at the forge - the same three calls fetch the same page either way -
+# and `processed` plus gh-mention-inbox/handled/ still keep a body from being
+# filed twice. The residual limit: a thread that stays beyond page one for
+# longer than the backfill window is missed through this path, and a body
+# edited later is deliberately not picked up here at all. Tagging a thread that
+# already exists is done by POSTING A COMMENT on it, which the two comment
+# listings above already cover and which has neither limit.
 # Repos are read least-recently-ATTEMPTED first and at most
 # FM_GH_MENTION_MAX_REPOS of them per sweep, so a watched set too large for one
 # sweep rotates across sweeps instead of starving its tail. Every attempt is
@@ -393,7 +403,7 @@ read_repo() {  # <owner/name> <since-iso> <candidates-out> <cursor-bound-out>
     | map(select(length >= $page) | (.[-1].updated_at // empty))
     | if length == 0 then "" else min end' > "$bound" || return 1
   jq -c -n --slurpfile c "$TMP/comments.json" --slurpfile r "$TMP/review.json" \
-    --slurpfile i "$TMP/issues.json" --arg since "$since" '
+    --slurpfile i "$TMP/issues.json" --arg floor "$BACKFILL_SINCE" '
     def norm($kind; $prefix):
       map(select((.user.login | type) == "string" and (.body | type) == "string"
           and (.html_url | type) == "string" and (.id | type) == "number")
@@ -403,7 +413,7 @@ read_repo() {  # <owner/name> <since-iso> <candidates-out> <cursor-bound-out>
     (($c[0] | norm("comment"; "comment-"))
       + ($r[0] | norm("review-comment"; "review-comment-"))
       + ($i[0]
-         | map(select((.created_at | type) == "string" and .created_at >= $since))
+         | map(select((.created_at | type) == "string" and .created_at >= $floor))
          | norm("body"; "issue-")))[]' > "$out"
 }
 

@@ -89,6 +89,9 @@ records_in() { find "$1/state/gh-mention-inbox" -maxdepth 1 -name '*.json' 2>/de
 # asserts the record's contract rather than its formatting.
 field() { jq -r "$2" "$1"; }
 wakes_in() { grep -c 'check: gh-mention' "$1/state/.wake-queue" 2>/dev/null || printf '0\n'; }
+# iso_ago <seconds>: a UTC stamp that many seconds before now, so a fixture can
+# sit inside or outside the poll's own backfill window whenever the suite runs.
+iso_ago() { jq -nr --argjson back "$1" '(now - $back | floor) | todateiso8601'; }
 
 # Ordering is by attempt, not by success, so repositories this host cannot read
 # cost their slot once per rotation instead of pinning themselves to the front
@@ -146,6 +149,40 @@ test_an_old_body_bumped_by_new_activity_is_not_a_new_mention() {
   assert_equals 1 "$(records_in "$home")" \
     "the old body is still not filed once the thread is genuinely tagged"
   pass "fm-gh-mention: an old body bumped by new activity is not filed as a new mention"
+}
+
+# Body admission is bounded by the poll's own backfill floor, not by the read
+# cursor: those are different clocks, and a busy repository whose first listing
+# page overflows advances the cursor past a thread that was opened inside the
+# window but never read.
+test_a_newly_opened_body_cut_off_from_page_one_is_still_filed() {
+  local home page cursor bumped created
+  home=$(make_home page-overflow '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
+  bumped=$(iso_ago 600)
+  created=$(iso_ago 1200)
+  # A full first page of untagged threads, all bumped after the tagged one was
+  # opened, so the overflow leaves the cursor ahead of that opening.
+  page=$(jq -nc --arg created "$created" --arg updated "$bumped" '[range(100) |
+    {id:(800 + .),user:{login:"someone-else"},body:"routine \(.)",
+     html_url:"https://github.com/o/busy/issues/\(800 + .)",
+     created_at:$created,updated_at:$updated}]')
+  canned "$home" o/busy issues "$page"
+  run_plane "$home" poll >/dev/null 2>&1
+  cursor=$(jq -r '.repos["o/busy"]' "$home/state/gh-mention-cursor.json")
+  assert_equals "$bumped" "$cursor" \
+    "a full page leaves the cursor at the last entry it actually read"
+  assert_equals 0 "$(records_in "$home")" "nothing on that page was tagged"
+
+  # Issue #42 was opened inside the poll's backfill window but sat beyond page
+  # one, so its creation time is older than the cursor the overflow left behind.
+  canned "$home" o/busy issues \
+    "[$(comment 842 mengsig '@firstmate please take this' \
+      'https://github.com/o/busy/issues/42' "$created")]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_present "$home/state/gh-mention-inbox/issue-842.json" \
+    "a thread opened inside the window must still be filed once the page no longer hides it"
+  assert_equals 1 "$(wakes_in "$home")" "the recovered mention queues its wake"
+  pass "fm-gh-mention: a newly opened body cut off from page one is still filed"
 }
 
 test_help_and_usage() {
@@ -856,3 +893,4 @@ test_a_sweep_reads_at_most_the_capped_number_of_repositories
 test_a_refused_allowance_is_named_as_itself
 test_unreadable_repos_do_not_starve_a_healthy_one
 test_an_old_body_bumped_by_new_activity_is_not_a_new_mention
+test_a_newly_opened_body_cut_off_from_page_one_is_still_filed

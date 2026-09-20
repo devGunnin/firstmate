@@ -698,8 +698,12 @@ Per watched repository it reads three repo-scoped listings, each bounded by that
 GitHub filters all three listings on `updated_at`, and a thread's `updated_at` moves on any activity at all - a new comment, a label, a reopen.
 For a comment that is exactly right, because only editing that comment moves its own stamp.
 For a body it is not: an issue whose body was tagged months ago and handled then would be filed as a fresh mention the first time this home reads that repository, and firstmate would reply publicly on a thread nobody newly asked about.
-So a body qualifies only when the thread was opened inside the window, which deliberately means a marker added by editing an old body is not picked up through this path.
-Posting a comment is what tags an existing thread, and the two comment listings already cover it.
+So a body qualifies only when the thread was opened more recently than `FM_GH_MENTION_BACKFILL` ago, which deliberately means a marker added by editing an old body is not picked up through this path.
+
+That floor is the poll's own, never the repository's read cursor: creation and update are two different clocks, and the cursor bounds only the second, so testing a creation against it would drop a thread that was opened inside the window but cut off from the first page of the listing.
+Re-scanning the wider window costs nothing at GitHub - the same three calls fetch the same page either way - and the processed-id list plus `gh-mention-inbox/handled/` still keep a body from being filed twice.
+One limit remains: a thread that stays beyond the first page of the issues listing for longer than the backfill window is not picked up through the body path at all.
+Posting a comment is what tags an existing thread, it has neither limit, and the two comment listings already cover it.
 Repositories are read least-recently-attempted first and at most `FM_GH_MENTION_MAX_REPOS` (default 5) of them per sweep, so the cost of a sweep is bounded by that cap rather than by how many projects happen to be registered here; a watched set larger than the cap rotates across sweeps instead of starving its tail, and a repository whose reads do not complete, or that held a qualifying mention the poll could not file, keeps its cursor so nothing is skipped.
 The attempt clock that orders sweeps is deliberately separate from that read cursor: every attempt is stamped, including one that failed, so a repository nobody can read yields its slot on the next sweep instead of holding one on every sweep and starving the repositories behind it, while its read cursor still never advances past a window it did not get through.
 
