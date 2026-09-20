@@ -849,6 +849,15 @@ test_bootstrap_keeps_another_planes_cadence_when_x_deps_are_missing() {
     "a cadence another plane asked for must survive X mode's missing dependencies"
   assert_grep "export FM_CHECK_INTERVAL=30" "$home/config/x-mode.env" \
     "the settled cadence is the one the mention plane asked for"
+
+  # The cadence file now exists, but it is still not Relay's, so a second
+  # session must not start blaming Relay for a file another plane owns.
+  out=$(PATH="$(fm_test_base_path_sans "$BASE_PATH" curl)" FM_HOME="$home" \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "MISSING: curl" "the missing dependency is still reported on a later session"
+  assert_not_contains "$out" "FMX:" \
+    "a home that never armed a relay shim must not be told about Relay every session"
+  assert_present "$home/config/x-mode.env" "the other plane keeps its cadence across sessions"
   pass "bootstrap keeps another plane's watcher cadence when X-mode dependencies are missing"
 }
 

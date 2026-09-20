@@ -65,10 +65,15 @@ canned() {
   printf '%s\n' "$json" > "$home/gh/${repo%/*}__${repo#*/}.$kind.json"
 }
 
-# comment <id> <login> <body> <html-url>: one listing entry in GitHub's shape.
+# comment <id> <login> <body> <html-url> [created-at]: one listing entry in
+# GitHub's shape. created_at defaults to now because the body listing admits
+# only threads opened inside the poll's window; pass an older stamp to model a
+# thread that merely got bumped back into the window.
 comment() {
   jq -nc --argjson id "$1" --arg login "$2" --arg body "$3" --arg url "$4" \
-    '{id:$id,user:{login:$login},body:$body,html_url:$url,updated_at:"2026-09-20T10:00:00Z"}'
+    --arg created "${5:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+    '{id:$id,user:{login:$login},body:$body,html_url:$url,
+      created_at:$created,updated_at:"2026-09-20T10:00:00Z"}'
 }
 
 run_plane() {  # <home> <action...>
@@ -113,6 +118,34 @@ test_unreadable_repos_do_not_starve_a_healthy_one() {
     "a healthy repository must be read once the failures rotate to the back"
   assert_equals 1 "$(wakes_in "$home")" "the mention in the healthy repository is queued"
   pass "fm-gh-mention: repositories that cannot be read never starve a healthy one"
+}
+
+# GitHub filters the issues listing on updated_at, which any thread activity
+# moves, so a thread tagged long ago and bumped today would otherwise be filed
+# as if it were newly asked - and answered publicly on a months-old thread.
+test_an_old_body_bumped_by_new_activity_is_not_a_new_mention() {
+  local home out
+  home=$(make_home bumped-body '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/r"]}')
+  canned "$home" o/r issues \
+    "[$(comment 10 mengsig '@firstmate please handle the parser' \
+      'https://github.com/o/r/issues/10' '2026-06-01T09:00:00Z')]"
+
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals 0 "$(records_in "$home")" \
+    "a body opened before the window must not be filed on a first arm"
+  assert_equals 0 "$(wakes_in "$home")" "no wake is queued for a thread nobody newly asked about"
+  assert_equals '' "$out" "the poll stays silent about a thread it correctly ignored"
+
+  # Tagging a thread that already exists is done by commenting on it.
+  canned "$home" o/r comments \
+    "[$(comment 11 mengsig '@firstmate the parser is still wrong' \
+      'https://github.com/o/r/issues/10#issuecomment-11')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_present "$home/state/gh-mention-inbox/comment-11.json" \
+    "a comment posted on that thread is what tags it, and it is picked up"
+  assert_equals 1 "$(records_in "$home")" \
+    "the old body is still not filed once the thread is genuinely tagged"
+  pass "fm-gh-mention: an old body bumped by new activity is not filed as a new mention"
 }
 
 test_help_and_usage() {
@@ -822,3 +855,4 @@ test_subject_type_comes_from_the_kind_segment
 test_a_sweep_reads_at_most_the_capped_number_of_repositories
 test_a_refused_allowance_is_named_as_itself
 test_unreadable_repos_do_not_starve_a_healthy_one
+test_an_old_body_bumped_by_new_activity_is_not_a_new_mention

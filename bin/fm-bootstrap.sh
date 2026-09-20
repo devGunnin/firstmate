@@ -1178,7 +1178,7 @@ x_mode_setup() {
     x_mode_artifact_present "$cadence" && had_cadence=1
     if x_mode_remove_artifacts; then
       x_mode_report_cadence_set "$cadence_other" "$cadence_other_plane"
-      if [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
+      if [ "$had_shim" -eq 1 ] || { [ -z "$cadence_other" ] && [ "$had_cadence" -eq 1 ]; }; then
         echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
       fi
     elif [ -n "$cadence_other" ]; then
