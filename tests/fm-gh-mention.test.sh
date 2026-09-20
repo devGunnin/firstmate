@@ -504,6 +504,30 @@ test_a_retried_mention_is_never_charged_twice() {
   pass "fm-gh-mention: a retried mention is never charged to a grant twice"
 }
 
+# The lapse line is news, so nothing suppresses a repeat of it. That makes its
+# report-once state load-bearing: an announcement this home cannot remember
+# would print on every poll, and every printed line is another wake.
+test_a_lapse_that_cannot_be_recorded_is_never_announced() {
+  local home out
+  home=$(make_home lapse-unrecordable \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","until":"2020-01-01T00:00:00Z"}],"repos":["o/r"]}')
+  mkdir -p "$home/elsewhere"
+  jq -n '{schema:"fm-gh-mention-cursor.v1",repos:{},processed:[],grants:{},lapsed:[]}' \
+    > "$home/elsewhere/cursor.json"
+  ln -s "$home/elsewhere/cursor.json" "$home/state/gh-mention-cursor.json"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_not_contains "$out" "has lapsed" \
+    "a lapse whose report-once state cannot be recorded must not be announced"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_not_contains "$out" "has lapsed" \
+    "an unrecordable lapse must not wake the supervisor on any later cycle either"
+  assert_equals '[]' "$(jq -c '.lapsed' "$home/elsewhere/cursor.json")" \
+    "a lapse that was never announced is never marked as reported"
+  assert_contains "$(run_plane "$home" status 2>&1)" "LAPSED" \
+    "status still shows the lapsed authorization the poll stayed silent about"
+  pass "fm-gh-mention: a lapse that cannot be recorded is never announced"
+}
+
 test_an_unspendable_bound_refuses_the_mention() {
   local home out
   home=$(make_home unspendable \
@@ -680,6 +704,7 @@ test_the_count_decrements_only_on_acceptance
 test_a_lapsed_grant_is_reported_once
 test_a_retried_mention_is_never_charged_twice
 test_an_unspendable_bound_refuses_the_mention
+test_a_lapse_that_cannot_be_recorded_is_never_announced
 test_a_malformed_grant_is_refused
 test_the_plane_requests_a_fast_watcher_cadence
 test_a_full_page_stops_the_cursor_where_the_read_stopped

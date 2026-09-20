@@ -23,6 +23,8 @@
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed after <cause>: <reason>",
 #                 "SECONDMATE_HANDOFF: secondmate <id>: pending delivery: <n> item(s)",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "WATCH_CADENCE: <what the home's one watcher cadence is now,
+#                 and which plane asked for it>",
 #                 "GH_MENTIONS: <what stops or limits the GitHub mention poll>".
 #          When a RUNNING secondmate home is fast-forwarded, its target is
 #          firstmate's own current default-branch commit. A local worktree uses
@@ -78,6 +80,10 @@
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.
+#          config/x-mode.env is the home's ONE watcher cadence, carrying the
+#          fastest interval any enabled plane asked for, so a transition that
+#          belongs to another plane prints a WATCH_CADENCE line naming that
+#          plane rather than an FMX line naming Relay.
 #          Fleet sync fetches, fast-forwards safe default-branch states, reports
 #          recovered and STUCK clone drift, and prunes gone local branches; it is
 #          bounded by FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT when it is a non-empty
@@ -1019,12 +1025,15 @@ x_mode_remove_artifact() {
 # config/x-mode.env keeps its name and its single writer (x_mode_setup below);
 # nothing else writes a cadence, starts a timer, or runs a second poll loop.
 WATCH_CADENCE_WANT=
+WATCH_CADENCE_OWNER=
 
-watch_cadence_request() {  # <seconds>
-  local want=$1
+watch_cadence_request() {  # <seconds> <plane>
+  local want=$1 plane=$2
   case "$want" in ''|*[!0-9]*|0) return 0 ;; esac
+  [ -n "$plane" ] || return 0
   if [ -z "$WATCH_CADENCE_WANT" ] || [ "$want" -lt "$WATCH_CADENCE_WANT" ]; then
     WATCH_CADENCE_WANT=$want
+    WATCH_CADENCE_OWNER=$plane
   fi
 }
 
@@ -1053,7 +1062,7 @@ watch_cadence_body() {  # <seconds>
 # the emitted harness-aware supervision repair instruction.
 x_mode_setup() {
   local env_file token shim cadence shim_body tool missing shim_home
-  local had_shim had_cadence cadence_other
+  local had_shim had_cadence cadence_other cadence_other_plane
   env_file="$FM_HOME/.env"
   shim="$STATE/x-watch.check.sh"
   cadence="$CONFIG/x-mode.env"
@@ -1065,6 +1074,14 @@ x_mode_setup() {
   # unwritable cadence has to go - but it must not take the file away from
   # another plane that is still asking for one either.
   cadence_other=$WATCH_CADENCE_WANT
+  cadence_other_plane=$WATCH_CADENCE_OWNER
+
+  # The cadence file is the home's, not Relay's, so a transition that belongs to
+  # another plane is reported in that plane's terms and names what the watcher
+  # actually ends up sweeping at. An FMX line routes the captain to Relay.
+  x_mode_report_cadence_unsettled() {
+    echo "WATCH_CADENCE: could not settle config/x-mode.env for $cadence_other_plane, which asked for a ${cadence_other}s sweep; it is polled at the watcher's default interval until that write succeeds"
+  }
 
   # Relay releasing the cadence never means the home loses it: another enabled
   # plane may still be asking for one, and there is only ever this one file.
@@ -1101,11 +1118,16 @@ x_mode_setup() {
     x_mode_artifact_present "$cadence" && had_cadence=1
     if x_mode_remove_artifacts; then
       if [ -n "$cadence_other" ]; then
-        [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - removed relay poll shim; the ${cadence_other}s watcher cadence stays for another enabled plane"
-      elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
+        [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - removed relay poll shim; the ${cadence_other}s watcher cadence stays for $cadence_other_plane"
+      elif [ "$had_shim" -eq 1 ]; then
         echo "FMX: X mode off - removed relay poll shim and 30s cadence; default cadence applies on the next supervision cycle; $(x_mode_supervision_repair)"
+      elif [ "$had_cadence" -eq 1 ]; then
+        echo "WATCH_CADENCE: no enabled plane asks for a fast watcher sweep now; removed config/x-mode.env, so checks return to the watcher's default interval on the next supervision cycle; $(x_mode_supervision_repair)"
       fi
-    elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ] || [ -n "$cadence_other" ]; then
+    elif [ -n "$cadence_other" ]; then
+      x_mode_report_cadence_unsettled
+      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - failed to remove relay poll shim"
+    elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
       echo "FMX: X mode off - failed to remove relay poll shim or 30s cadence"
     fi
     return 0
@@ -1130,7 +1152,10 @@ x_mode_setup() {
       if [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
         echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
       fi
-    elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ] || [ -n "$cadence_other" ]; then
+    elif [ -n "$cadence_other" ]; then
+      x_mode_report_cadence_unsettled
+      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - failed to remove relay poll shim after missing relay poll dependencies"
+    elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
       echo "FMX: X mode off - failed to remove relay poll shim or 30s cadence after missing relay poll dependencies"
     fi
     return 0
@@ -1144,7 +1169,7 @@ x_mode_setup() {
     fi
   }
 
-  watch_cadence_request 30
+  watch_cadence_request 30 'the relay poll'
   mkdir -p "$STATE" "$CONFIG" 2>/dev/null || { fmx_arm_failed; return 0; }
 
   case "$FM_HOME" in
@@ -1186,7 +1211,7 @@ gh_mentions_setup() {
     && ! "$plane" disarm >/dev/null 2>&1; then
     echo "GH_MENTIONS: could not retire the mention poll this home cannot arm"
   fi
-  [ "$rc" -ne 0 ] || watch_cadence_request "$("$plane" cadence 2>/dev/null)"
+  [ "$rc" -ne 0 ] || watch_cadence_request "$("$plane" cadence 2>/dev/null)" 'the GitHub mention plane'
   while IFS= read -r line; do
     case "$line" in
       ''|'armed: '*|'disarmed: '*) ;;

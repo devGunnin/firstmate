@@ -852,6 +852,50 @@ test_bootstrap_keeps_another_planes_cadence_when_x_deps_are_missing() {
   pass "bootstrap keeps another plane's watcher cadence when X-mode dependencies are missing"
 }
 
+# A cadence transition that belongs to another plane must not be reported in
+# Relay's voice: AGENTS.md routes every FMX: line to Relay handling, so a home
+# that never opted into Relay would be sent to the wrong plane.
+test_bootstrap_reports_a_cadence_wind_down_without_claiming_relay() {
+  local home out
+  home="$TMP_ROOT/boot-cadence-winddown"; mkdir -p "$home/config"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
+  assert_present "$home/config/x-mode.env" "the mention plane's request must create the shared cadence"
+  assert_absent "$home/state/x-watch.check.sh" "a home with no pairing token arms no relay shim"
+
+  rm -f "$home/config/gh-mentions.json"
+  out=$(PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_absent "$home/config/x-mode.env" "the shared cadence goes once no plane asks for it"
+  assert_not_contains "$out" "FMX:" \
+    "a home that never had a relay shim must not be told Relay removed one"
+  assert_contains "$out" "WATCH_CADENCE: no enabled plane asks for a fast watcher sweep now" \
+    "the wind-down is reported as a shared-cadence transition"
+  pass "bootstrap reports a shared-cadence wind-down without claiming Relay removed it"
+}
+
+test_bootstrap_names_the_plane_whose_cadence_it_could_not_settle() {
+  local home out
+  home="$TMP_ROOT/boot-cadence-unsettled"; mkdir -p "$home/config"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  printf 'external cadence sentinel\n' > "$home/external-cadence"
+  ln -s "$home/external-cadence" "$home/config/x-mode.env"
+
+  out=$(PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_contains "$out" "WATCH_CADENCE: could not settle config/x-mode.env for the GitHub mention plane" \
+    "a cadence this home could not write must name the plane that asked for it"
+  assert_contains "$out" "30s sweep" "the line names the interval that plane asked for"
+  assert_contains "$out" "default interval" "the line states what that plane is polled at instead"
+  assert_not_contains "$out" "FMX:" \
+    "another plane's cadence failure must not be reported as Relay's"
+  assert_grep "external cadence sentinel" "$home/external-cadence" \
+    "the rejected link target must be left untouched"
+  pass "bootstrap names the plane whose watcher cadence it could not settle"
+}
+
 test_bootstrap_does_not_announce_when_arm_fails() {
   local home out
   home="$TMP_ROOT/boot-arm-fail"; mkdir -p "$home"
@@ -3132,6 +3176,8 @@ test_bootstrap_activates_on_env_token
 test_bootstrap_relative_home_writes_absolute_poll_shim
 test_bootstrap_reports_missing_x_dependency
 test_bootstrap_keeps_another_planes_cadence_when_x_deps_are_missing
+test_bootstrap_reports_a_cadence_wind_down_without_claiming_relay
+test_bootstrap_names_the_plane_whose_cadence_it_could_not_settle
 test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_does_not_follow_x_artifact_symlinks
 test_bootstrap_inert_without_token

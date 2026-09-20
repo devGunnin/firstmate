@@ -66,6 +66,16 @@
 # wake and the processed-id list is extended AFTER it, so a crash can duplicate
 # a wake but can never consume a pending record.
 #
+# AN UNWRITABLE state/ STOPS THIS PLANE, IT DOES NOT DEGRADE IT. Every durable
+# step fails closed: a bound that cannot be spent refuses its mention, a mention
+# that cannot be filed holds its repo at its cursor, and a lapse that cannot be
+# recorded is not announced. The hold is what keeps a mention from being stepped
+# over, but a permanently unwritable state/ means that repo re-reads the same
+# window forever, and once more than one page accumulates in it, newer tagged
+# comments fall beyond page one and are never read. The condition is reported
+# once, so this is loud exactly once: a `could not` line from this plane is
+# blocking, and the repo resumes from its cursor once state/ is writable again.
+#
 # RESPONSE LATENCY. An enabled plane asks the home's watcher for a sweep every
 # `check_interval` seconds (default 30) instead of the default 300, so a tagged
 # comment is picked up in tens of seconds. That request goes through the one
@@ -432,15 +442,23 @@ grants_describe() {  # <cursor-json> <now-iso>
 }
 
 # Report each bounded authorization that has ended and has not been reported
-# yet, then remember it, so a captain whose tagging stopped working learns why
-# once instead of guessing. The entry is never deleted and never auto-renewed.
+# yet, so a captain whose tagging stopped working learns why once instead of
+# guessing. The entry is never deleted and never auto-renewed.
+#
+# The report is recorded durably BEFORE it is made, the same order grant_charge
+# spends a bound in. This is news rather than a diagnostic, so nothing
+# suppresses a repeat of it; an announcement this home cannot remember would
+# repeat on every poll, and a repeated line is a repeated wake. A lapse whose
+# record cannot be written therefore stays silent, and `status` still shows it.
 grants_report_lapsed() {  # <cursor-json> <now-iso>
   local id why
   while IFS=$'\t' read -r id why; do
     [ -n "$id" ] || continue
-    say "the bounded authorization for $id has lapsed because $why; it no longer qualifies until the captain renews it"
     jq --arg id "$id" '.lapsed = (((.lapsed // []) + [$id]) | unique)' "$1" > "$TMP/lapsed.json" \
-      && mv -f -- "$TMP/lapsed.json" "$1"
+      || continue
+    cursor_write "$TMP/lapsed.json" || continue
+    mv -f -- "$TMP/lapsed.json" "$1" || continue
+    say "the bounded authorization for $id has lapsed because $why; it no longer qualifies until the captain renews it"
   done < <(grants_lapsed_unreported "$1" "$2")
 }
 

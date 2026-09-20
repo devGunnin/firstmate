@@ -705,6 +705,12 @@ Generated state, all under `state/` and gitignored:
 - `gh-mention.reported` - the failure diagnostics the last poll printed.
   The watcher wakes firstmate on any check output, so a condition that outlives one poll - an unreadable repository, a missing tool, a broken configuration - is reported once rather than on every cycle, and is reported again if it clears and returns.
   Unlike the cursor it does not survive `disarm`, so a condition still standing when the plane is re-armed is reported again.
+
+**When this home's own `state/` cannot be written.**
+Every durable step here fails closed, which bounds what is lost but does not make the plane work: a spend that cannot be recorded refuses its mention, a mention that cannot be filed holds its repository at its cursor, and an authorization whose lapse cannot be recorded is not announced.
+That hold is deliberate - it is what stops a mention from being stepped over - but when the write problem is permanent rather than transient, the held repository keeps re-reading the same window, and once more than one page of activity accumulates in it, newer tagged comments fall beyond the first page and are not read at all.
+The condition is reported once, so nothing repeats after the first poll.
+Treat a `could not` line from this plane as blocking: fix the `state/` write problem - a full disk, a read-only or missing directory, a path replaced by a symlink - and the held repository resumes from its cursor on the next poll.
 - `gh-mention.check.sh` and `gh-mention.check-trust` - the standing poll shim and its watcher trust binding.
 
 Each accepted mention appends exactly one durable `check: gh-mention <record-id>` wake.
@@ -767,6 +773,9 @@ The active primary-harness supervision protocol owns how that sourced cadence re
 Because the interval is read only at watcher start, a cadence transition - a plane opted in while a watcher is already running, or opted out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
 When no plane asks for a speed-up any more, the next locked session-start bootstrap step removes the file and the default cadence applies on the next supervision cycle.
 Steady-state off is silent and writes nothing.
+
+Because the file is shared, a transition to it is reported as a `WATCH_CADENCE:` line naming the plane that asked for the interval and what the watcher sweeps at as a result, not as the `FMX:` line that belongs to Relay's own poll artifacts.
+A home that never opted into Relay is therefore never told Relay removed or failed to remove something, and a cadence write that fails names the plane left polling at the default 300 seconds.
 
 ## Relay (.env)
 
