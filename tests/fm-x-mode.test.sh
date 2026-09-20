@@ -1013,7 +1013,8 @@ test_bootstrap_names_the_unsettled_cadence_plane_when_relay_arming_fails() {
 
   assert_contains "$out" "WATCH_CADENCE: could not settle config/x-mode.env for the GitHub mention plane" \
     "a cadence left unsettled by a failed relay arm must still name the plane that asked"
-  assert_contains "$out" "stale artifacts remain" "relay still reports its own failed arm"
+  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim" \
+    "relay still reports its own failed arm, without speaking for the cadence"
   assert_grep "external cadence sentinel" "$home/external-cadence" \
     "the rejected link target must be left untouched"
   pass "bootstrap names the plane whose cadence a failed relay arm left unsettled"
@@ -1045,6 +1046,32 @@ test_bootstrap_reports_a_wind_down_from_the_missing_dependency_branch() {
   assert_not_contains "$out" "FMX:" \
     "a home that never armed a relay shim is never told about Relay"
   pass "bootstrap reports a shared-cadence wind-down from the missing-dependency branch"
+}
+
+# The relay shim and the shared cadence succeed or fail independently. When only
+# the shim removal fails, the cadence transition that did happen must still be
+# reported - it carries the pointer that gets a running watcher onto the new
+# interval - and must not be described as a write that failed.
+test_bootstrap_reports_a_settled_cadence_when_only_the_shim_removal_fails() {
+  local home out
+  home="$TMP_ROOT/boot-partial-removal"; mkdir -p "$home/state" "$home/config"
+  printf 'FMX_PAIRING_TOKEN=\n' > "$home/.env"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  # A leftover relay shim this bootstrap cannot remove, while config/ stays fine.
+  mkdir -p "$home/state/x-watch.check.sh"
+
+  out=$(PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_grep "export FM_CHECK_INTERVAL=30" "$home/config/x-mode.env" \
+    "the mention plane's cadence is written even though the shim removal failed"
+  assert_contains "$out" "WATCH_CADENCE: the GitHub mention plane asked for a 30s sweep" \
+    "the cadence transition that did happen must be reported as settled"
+  assert_not_contains "$out" "could not settle config/x-mode.env" \
+    "a settled cadence must never be reported as a write that failed"
+  assert_contains "$out" "FMX: X mode off - failed to remove relay poll shim" \
+    "the shim removal failure is still reported as Relay's own"
+  pass "bootstrap reports a settled cadence when only the relay shim removal fails"
 }
 
 test_bootstrap_does_not_announce_when_arm_fails() {
@@ -3334,6 +3361,7 @@ test_bootstrap_reports_a_cadence_settled_while_relay_arming_failed
 test_bootstrap_reports_a_cadence_change_on_a_relay_home
 test_bootstrap_names_the_unsettled_cadence_plane_when_relay_arming_fails
 test_bootstrap_reports_a_wind_down_from_the_missing_dependency_branch
+test_bootstrap_reports_a_settled_cadence_when_only_the_shim_removal_fails
 test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_does_not_follow_x_artifact_symlinks
 test_bootstrap_inert_without_token

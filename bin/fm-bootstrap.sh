@@ -1079,6 +1079,7 @@ watch_cadence_body() {  # <seconds>
 x_mode_setup() {
   local env_file token shim cadence shim_body tool missing shim_home
   local had_shim had_cadence cadence_other cadence_other_plane cadence_before
+  local shim_removed cadence_settled
   env_file="$FM_HOME/.env"
   shim="$STATE/x-watch.check.sh"
   cadence="$CONFIG/x-mode.env"
@@ -1138,11 +1139,14 @@ x_mode_setup() {
     x_mode_remove_artifact "$cadence"
   }
 
+  # The shim and the shared cadence succeed or fail independently, so each
+  # outcome is kept apart: collapsing them reports a transition that did happen
+  # as failed, and swallows the repair pointer that goes with it.
   x_mode_remove_artifacts() {
-    local failed=0
-    x_mode_remove_artifact "$shim" || failed=1
-    x_mode_settle_cadence || failed=1
-    [ "$failed" -eq 0 ]
+    shim_removed=1
+    cadence_settled=1
+    x_mode_remove_artifact "$shim" || shim_removed=0
+    x_mode_settle_cadence || cadence_settled=0
   }
 
   x_mode_supervision_repair() {
@@ -1156,12 +1160,14 @@ x_mode_setup() {
     # Opt-out (or never opted in): drop Relay's own shim and settle the shared
     # cadence. Report only what actually changed, so a home that merely keeps
     # the cadence for another plane hears nothing about Relay every session.
-    if x_mode_remove_artifacts; then
-      x_mode_report_cadence 1
-      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - removed relay poll shim"
-    else
-      x_mode_report_cadence 0
-      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - failed to remove relay poll shim"
+    x_mode_remove_artifacts
+    x_mode_report_cadence "$cadence_settled"
+    if [ "$had_shim" -eq 1 ]; then
+      if [ "$shim_removed" -eq 1 ]; then
+        echo "FMX: X mode off - removed relay poll shim"
+      else
+        echo "FMX: X mode off - failed to remove relay poll shim"
+      fi
     fi
     return 0
   fi
@@ -1177,24 +1183,26 @@ x_mode_setup() {
     # Relay cannot arm, but another plane's cadence request still has to be
     # settled: the cadence is the home's, not Relay's. Report only what was
     # actually there, so a home that never armed Relay hears nothing.
-    if x_mode_remove_artifacts; then
-      x_mode_report_cadence 1
-      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
-    else
-      x_mode_report_cadence 0
-      [ "$had_shim" -eq 0 ] || echo "FMX: X mode off - failed to remove relay poll shim after missing relay poll dependencies"
+    x_mode_remove_artifacts
+    x_mode_report_cadence "$cadence_settled"
+    if [ "$had_shim" -eq 1 ]; then
+      if [ "$shim_removed" -eq 1 ]; then
+        echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
+      else
+        echo "FMX: X mode off - failed to remove relay poll shim after missing relay poll dependencies"
+      fi
     fi
     return 0
   fi
 
   fmx_arm_failed() {
-    if x_mode_remove_artifacts; then
-      x_mode_report_cadence 1
+    x_mode_remove_artifacts
+    x_mode_report_cadence "$cadence_settled"
+    if [ "$shim_removed" -eq 1 ]; then
       echo "FMX: X mode off - failed to arm relay poll shim"
-      return 0
+    else
+      echo "FMX: X mode off - failed to arm relay poll shim; a stale shim remains"
     fi
-    x_mode_report_cadence 0
-    echo "FMX: X mode off - failed to arm relay poll shim; stale artifacts remain"
   }
 
   watch_cadence_request 30 'the relay poll'

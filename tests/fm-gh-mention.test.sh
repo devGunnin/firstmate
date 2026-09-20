@@ -185,6 +185,32 @@ test_a_newly_opened_body_cut_off_from_page_one_is_still_filed() {
   pass "fm-gh-mention: a newly opened body cut off from page one is still filed"
 }
 
+# The window a poll reads starts at the earlier of the backfill floor and the
+# repository's read cursor. A home that was not polling for longer than the
+# backfill window reads from its cursor, so a tag opened in that gap must still
+# be admitted rather than stepped over when the cursor advances past it.
+test_a_body_opened_while_the_cursor_was_behind_is_still_filed() {
+  local home behind created
+  home=$(make_home offline-gap '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/r"]}')
+  behind=$(iso_ago 36000)
+  created=$(iso_ago 10800)
+  jq -n --arg s fm-gh-mention-cursor.v1 --arg behind "$behind" \
+    '{schema:$s,repos:{"o/r":$behind},processed:[],grants:{},lapsed:[],attempted:{}}' \
+    > "$home/state/gh-mention-cursor.json"
+  canned "$home" o/r issues \
+    "[$(comment 77 mengsig '@firstmate please fix the parser' \
+      'https://github.com/o/r/issues/77' "$created")]"
+
+  run_plane "$home" poll >/dev/null 2>&1
+
+  assert_present "$home/state/gh-mention-inbox/issue-77.json" \
+    "a body opened while the cursor was behind must be filed, not stepped over"
+  assert_equals 1 "$(wakes_in "$home")" "the recovered mention queues its wake"
+  assert_equals body "$(field "$home/state/gh-mention-inbox/issue-77.json" .comment_kind)" \
+    "it is recorded as the thread body it is"
+  pass "fm-gh-mention: a body opened while the cursor was behind is still filed"
+}
+
 test_help_and_usage() {
   local out rc=0
   out=$("$PLANE" --help 2>&1) || rc=$?
@@ -894,3 +920,4 @@ test_a_refused_allowance_is_named_as_itself
 test_unreadable_repos_do_not_starve_a_healthy_one
 test_an_old_body_bumped_by_new_activity_is_not_a_new_mention
 test_a_newly_opened_body_cut_off_from_page_one_is_still_filed
+test_a_body_opened_while_the_cursor_was_behind_is_still_filed

@@ -698,11 +698,13 @@ Per watched repository it reads three repo-scoped listings, each bounded by that
 GitHub filters all three listings on `updated_at`, and a thread's `updated_at` moves on any activity at all - a new comment, a label, a reopen.
 For a comment that is exactly right, because only editing that comment moves its own stamp.
 For a body it is not: an issue whose body was tagged months ago and handled then would be filed as a fresh mention the first time this home reads that repository, and firstmate would reply publicly on a thread nobody newly asked about.
-So a body qualifies only when the thread was opened more recently than `FM_GH_MENTION_BACKFILL` ago, which deliberately means a marker added by editing an old body is not picked up through this path.
+So a body qualifies only when the thread was opened inside the window this poll is actually reading, which deliberately means a marker added by editing an old body is not picked up through this path.
 
-That floor is the poll's own, never the repository's read cursor: creation and update are two different clocks, and the cursor bounds only the second, so testing a creation against it would drop a thread that was opened inside the window but cut off from the first page of the listing.
-Re-scanning the wider window costs nothing at GitHub - the same three calls fetch the same page either way - and the processed-id list plus `gh-mention-inbox/handled/` still keep a body from being filed twice.
-One limit remains: a thread that stays beyond the first page of the issues listing for longer than the backfill window is not picked up through the body path at all.
+That window starts at the earlier of two floors, because neither alone is right.
+`FM_GH_MENTION_BACKFILL` alone drops a tag opened while this home was not polling at all, since a repository whose read cursor is further behind than that reads a window starting before it.
+The read cursor alone drops a tag opened inside the window but cut off from the first page of the listing, since creation and update are different clocks and the cursor bounds only the second.
+Taking the earlier of the two admits both, adds no stored state, and costs nothing at GitHub - the same three calls fetch the same page either way - while the processed-id list and `gh-mention-inbox/handled/` keep a body from being filed twice.
+What the body path still does not see: a body edited after it was opened, and a thread opened before both floors, which requires it to have stayed beyond the first page until the read cursor passed its opening.
 Posting a comment is what tags an existing thread, it has neither limit, and the two comment listings already cover it.
 Repositories are read least-recently-attempted first and at most `FM_GH_MENTION_MAX_REPOS` (default 5) of them per sweep, so the cost of a sweep is bounded by that cap rather than by how many projects happen to be registered here; a watched set larger than the cap rotates across sweeps instead of starving its tail, and a repository whose reads do not complete, or that held a qualifying mention the poll could not file, keeps its cursor so nothing is skipped.
 The attempt clock that orders sweeps is deliberately separate from that read cursor: every attempt is stamped, including one that failed, so a repository nobody can read yields its slot on the next sweep instead of holding one on every sweep and starving the repositories behind it, while its read cursor still never advances past a window it did not get through.

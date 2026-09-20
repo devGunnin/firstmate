@@ -39,23 +39,25 @@
 # constant per repo rather than growing with repo history:
 #   repos/<o>/<r>/issues/comments  issue and PR conversation comments
 #   repos/<o>/<r>/pulls/comments   PR review comments
-#   repos/<o>/<r>/issues           bodies of threads OPENED recently
+#   repos/<o>/<r>/issues           bodies of threads OPENED in the window read
 # GitHub filters all three by `since` on updated_at, and a thread's updated_at
 # moves on ANY activity - a new comment, a label, a reopen. For a comment that
 # is what is wanted, because only editing THAT comment moves its own stamp. For
 # a body it is not: an issue tagged months ago and bumped today would be filed
-# as if it were newly asked. So a body qualifies only when its created_at is
-# newer than FM_GH_MENTION_BACKFILL ago.
+# as if it were newly asked. So a body qualifies only when it was OPENED inside
+# the window this poll is actually reading.
 #
-# That floor is the POLL'S OWN, never the repo's read cursor: creation and
-# update are two different clocks and the cursor bounds only the second, so
-# testing a creation against it drops a thread that was opened inside the
-# window but cut off from page one of the listing. The wider re-scan costs
-# nothing at the forge - the same three calls fetch the same page either way -
-# and `processed` plus gh-mention-inbox/handled/ still keep a body from being
-# filed twice. The residual limit: a thread that stays beyond page one for
-# longer than the backfill window is missed through this path, and a body
-# edited later is deliberately not picked up here at all. Tagging a thread that
+# That window starts at the EARLIER of two floors, and neither alone is right.
+# The backfill floor alone drops a tag opened while this home was not polling,
+# because a cursor further behind than FM_GH_MENTION_BACKFILL reads a window
+# that starts before it. The read cursor alone drops a tag opened inside the
+# window but cut off from page one, because creation and update are different
+# clocks and the cursor bounds only the second. Taking the earlier of the two
+# admits both and costs nothing at the forge - the same three calls fetch the
+# same page either way - while `processed` and gh-mention-inbox/handled/ keep a
+# body from being filed twice. What is left out: a body edited after it was
+# opened, and a thread opened before BOTH floors, which needs it to have stayed
+# beyond page one until the cursor passed its opening. Tagging a thread that
 # already exists is done by POSTING A COMMENT on it, which the two comment
 # listings above already cover and which has neither limit.
 # Repos are read least-recently-ATTEMPTED first and at most
@@ -403,14 +405,15 @@ read_repo() {  # <owner/name> <since-iso> <candidates-out> <cursor-bound-out>
     | map(select(length >= $page) | (.[-1].updated_at // empty))
     | if length == 0 then "" else min end' > "$bound" || return 1
   jq -c -n --slurpfile c "$TMP/comments.json" --slurpfile r "$TMP/review.json" \
-    --slurpfile i "$TMP/issues.json" --arg floor "$BACKFILL_SINCE" '
+    --slurpfile i "$TMP/issues.json" --arg since "$since" --arg backfill "$BACKFILL_SINCE" '
     def norm($kind; $prefix):
       map(select((.user.login | type) == "string" and (.body | type) == "string"
           and (.html_url | type) == "string" and (.id | type) == "number")
         | {record_id: ($prefix + (.id | tostring)), comment_kind: $kind,
            comment_id: .id, comment_url: .html_url,
            author: .user.login, body: .body});
-    (($c[0] | norm("comment"; "comment-"))
+    (if $since < $backfill then $since else $backfill end) as $floor
+    | (($c[0] | norm("comment"; "comment-"))
       + ($r[0] | norm("review-comment"; "review-comment-"))
       + ($i[0]
          | map(select((.created_at | type) == "string" and .created_at >= $floor))
