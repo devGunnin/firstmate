@@ -888,7 +888,7 @@ test_bootstrap_reports_a_cadence_wind_down_without_claiming_relay() {
 # changed is only real once that watcher is restarted. Silence here leaves the
 # plane that asked for a fast sweep polled at the 300s default instead.
 test_bootstrap_reports_a_shared_cadence_the_watcher_must_pick_up() {
-  local home out optin_line change_line winddown_line
+  local home out optin_line winddown_line
   home="$TMP_ROOT/boot-cadence-optin"; mkdir -p "$home/config"
   printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
     > "$home/config/gh-mentions.json"
@@ -905,24 +905,14 @@ test_bootstrap_reports_a_shared_cadence_the_watcher_must_pick_up() {
   assert_not_contains "$out" "WATCH_CADENCE" \
     "an unchanged interval must not be re-reported on every session start"
 
-  # A later edit of the configured interval is the same transition.
-  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"],"check_interval":120}' \
-    > "$home/config/gh-mentions.json"
-  out=$(PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
-  change_line=$(printf '%s\n' "$out" | grep '^WATCH_CADENCE:' | head -1)
-  assert_contains "$change_line" "the GitHub mention plane asked for a 120s sweep" \
-    "changing the configured interval must be reported like the first opt-in"
-  assert_grep "export FM_CHECK_INTERVAL=120" "$home/config/x-mode.env" \
-    "the shared cadence file carries the new interval"
-
   # The repair pointer is what gets a running watcher onto the new interval, so
   # it must be the same one the wind-down transition already emits.
   rm -f "$home/config/gh-mentions.json"
   out=$(PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
   winddown_line=$(printf '%s\n' "$out" | grep '^WATCH_CADENCE:' | head -1)
   [ -n "$winddown_line" ] || fail "the wind-down transition printed no cadence line"
-  assert_equals "${winddown_line##*; }" "${change_line##*; }" \
-    "a cadence change must carry the same supervision-repair pointer as the wind-down"
+  assert_equals "${winddown_line##*; }" "${optin_line##*; }" \
+    "every cadence transition carries the same supervision-repair pointer"
   pass "bootstrap reports a shared-cadence change the running watcher must pick up"
 }
 
@@ -990,13 +980,13 @@ test_bootstrap_reports_a_cadence_change_on_a_relay_home() {
   assert_not_contains "$out" "WATCH_CADENCE" \
     "an unchanged interval stays silent even though the relay line repeats"
 
-  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"],"check_interval":10}' \
-    > "$home/config/gh-mentions.json"
+  # Winding the mention plane down is the transition in the other direction, and
+  # on a relay home the relay's own request keeps the file alive at 30.
+  rm -f "$home/config/gh-mentions.json"
   out=$(PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
-  assert_contains "$out" "WATCH_CADENCE: the GitHub mention plane asked for a 10s sweep" \
-    "a faster interval requested on a relay home must be reported as a transition"
-  assert_grep "export FM_CHECK_INTERVAL=10" "$home/config/x-mode.env" \
-    "the shared cadence file carries the faster interval"
+  assert_grep "export FM_CHECK_INTERVAL=30" "$home/config/x-mode.env" \
+    "relay still holds the shared cadence once the mention plane stops asking"
+  assert_contains "$out" "FMX: X mode on" "relay keeps announcing its own arm"
   pass "bootstrap reports a shared-cadence change on a home where relay itself arms"
 }
 

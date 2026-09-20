@@ -651,24 +651,31 @@ This section is the single owner of the configuration schema and the generated s
     {"login": "a-collaborator", "until": "2026-10-01T00:00:00Z", "remaining": 5}
   ],
   "markers": ["@firstmate", "@captain"],
-  "repos": ["owner/name"],
-  "check_interval": 30
+  "repos": ["owner/name"]
 }
 ```
 
-`enabled` and `trusted_logins` are required; `markers` defaults to `@firstmate` and `@captain`, `repos` defaults to empty, and `check_interval` defaults to 30.
+`enabled` and `trusted_logins` are required; `markers` defaults to `@firstmate` and `@captain`, and `repos` defaults to empty.
 A malformed or unreadable file, including an unknown key, stops the plane with an actionable error rather than falling back on a default.
 That strictness is deliberate: a typo in `trusted_logins` would otherwise silently widen or narrow who firstmate obeys.
 
 **What is watched is repositories, not accounts.**
 The watched set is this home's registered projects, each contributing the `github.com` origin of its `projects/<name>` clone as `owner/name`, plus every entry in `repos`, which covers a repository that should be watched without being cloned here.
 Which account owns a watched repository does not matter: a qualifying mention is handled identically in all of them.
-A registered project with no clone here, no origin, or a non-GitHub origin contributes nothing and is named by `bin/fm-gh-mention.sh status` and by session start, never silently dropped.
+A registered project with no clone here, no origin, or a non-GitHub origin contributes nothing and is never silently dropped: `bin/fm-gh-mention.sh status` lists the whole set on demand, and session start reports it when that set changes.
+A project on another forge or cloned elsewhere is an ordinary steady state, so an unchanged set says nothing on every session start, the same way an unchanged cadence does.
 
 **Trust is the safety core.**
 A comment or body qualifies only when both conditions hold on that same body: its author's GitHub login is on `trusted_logins`, matched exactly and case-insensitively by login and never by display name, and that body carries one of the `markers`, matched case-insensitively as a literal substring.
 The marker is what separates a request meant for firstmate from ordinary conversation by a trusted account; without it, every comment a trusted collaborator writes would start work.
-Because only the body's own author is checked, a marker quoted from someone else never qualifies on its own.
+Because only the body's own author is checked, a marker quoted from an untrusted account never qualifies on its own.
+A trusted collaborator who posts a body carrying a marker authored it deliberately - quote-reply included - so it is treated as a request, which is what it is.
+
+**The account this home posts as cannot tag it.**
+firstmate answers a mention by commenting on the thread, that comment is authored by the signed-in GitHub account, and a reply that restates the ask would carry a marker - so the next sweep would read firstmate's own reply back as a fresh mention and answer itself in public.
+The poll therefore resolves that account once, remembers it in `state/gh-mention-cursor.json`, and never qualifies a body authored by it.
+The cost is exactly one account: if the captain is signed in here as `mengsig`, then tags have to come from `devGunnin` or another login on `trusted_logins`, which is why the list holds more than one.
+`.agents/skills/gh-mention-respond/SKILL.md` additionally forbids any configured marker in a public reply, which is what covers a home where the signed-in account cannot be resolved at all.
 Everything that does not qualify is ignored silently: no record, no wake, and no write to GitHub.
 Authorizing a collaborator is exactly adding their login to `trusted_logins`, and every listed login carries the same authority.
 A bound limits how long or how often an account may ask, never what it may ask for, so per-account authority tiers do not exist.
@@ -717,6 +724,7 @@ Generated state, all under `state/` and gitignored:
 - `gh-mention.reported` - the failure diagnostics the last poll printed.
   The watcher wakes firstmate on any check output, so a condition that outlives one poll - an unreadable repository, a missing tool, a broken configuration - is reported once rather than on every cycle, and is reported again if it clears and returns.
   Unlike the cursor it does not survive `disarm`, so a condition still standing when the plane is re-armed is reported again.
+- `gh-mention.unwatched` - the registered projects that resolved to no repository at the last arm, so session start reports that set only when it changes.
 - `gh-mention.check.sh` and `gh-mention.check-trust` - the standing poll shim and its watcher trust binding.
 
 **When this home's own `state/` cannot be written.**
@@ -729,12 +737,12 @@ Each accepted mention appends exactly one durable `check: gh-mention <record-id>
 A crash can duplicate that wake but can never consume the pending record, so a mention is never lost.
 
 **Response latency.**
-An enabled plane asks this home's watcher to sweep every `check_interval` seconds (default 30, valid 10 to 300) instead of the default 300, so a tagged comment is picked up in tens of seconds.
+An enabled plane asks this home's watcher for a 30-second sweep instead of the default 300, the same fixed request Relay makes, so a tagged comment is picked up in tens of seconds.
 That request goes through the one cadence file `config/x-mode.env`, whose contract "Watcher cadence" above owns: a home running both this plane and Relay ends up with a single interval, the fastest either asked for, and neither plane runs a timer or a poll loop of its own.
 A tight cadence is affordable because the cost of a sweep is capped rather than proportional to the watched set.
-The ceiling is `3 x FM_GH_MENTION_MAX_REPOS x (3600 / check_interval)` authenticated REST calls per hour - 1800 at the defaults (5 repositories, 30 seconds) - and it does not move when more projects are registered here.
-That matters because GitHub's authenticated hourly allowance is shared with `bin/fm-pr-poll.sh`, `bin/fm-contributions.sh`, `gh-axi`, and crewmate work on the same host; lower the cap or raise `check_interval` to buy the rest of the host more headroom.
-What a watched set larger than the cap costs instead is pickup time: a tagged comment is picked up within `ceil(watched / FM_GH_MENTION_MAX_REPOS) x check_interval` in the worst case, so 12 watched repositories at the defaults are still swept inside 90 seconds rather than exhausting the allowance.
+The ceiling is `3 x FM_GH_MENTION_MAX_REPOS x 120` authenticated REST calls per hour - 1800 at the default cap of 5 repositories - and it does not move when more projects are registered here.
+That matters because GitHub's authenticated hourly allowance is shared with `bin/fm-pr-poll.sh`, `bin/fm-contributions.sh`, `gh-axi`, and crewmate work on the same host; `FM_GH_MENTION_MAX_REPOS` is the control that buys the rest of the host more headroom.
+What a watched set larger than the cap costs instead is pickup time: a tagged comment is picked up within `ceil(watched / FM_GH_MENTION_MAX_REPOS) x 30 seconds` in the worst case, so 12 watched repositories at the default cap are still swept inside 90 seconds rather than exhausting the allowance.
 Because the order is by attempt rather than by success, that bound holds whether the other watched repositories read cleanly or not - repositories this host has lost access to cost their slot once per rotation, never every sweep.
 When the allowance does run out, the poll says so in those words and stops reading for that cycle, rather than reporting the repository it happened to reach first as unreadable.
 
@@ -782,7 +790,7 @@ Some planes need a faster sweep than that to be useful, so each one REQUESTS an 
 This section is the single owner of that contract.
 There is one cadence, one file, and one writer; a plane never starts a timer, a second poll loop, or a competing interval of its own.
 
-The requesters today are Relay, which asks for 30 seconds whenever it is opted in, and the GitHub mention plane, which asks for its configured `check_interval` whenever it is enabled with something to watch.
+The requesters today are Relay, which asks for 30 seconds whenever it is opted in, and the GitHub mention plane, which asks for the same 30 seconds whenever it is enabled with something to watch.
 A home with neither enabled has no such file and keeps the default 300 seconds.
 A home with both gets one interval, so opting into the second plane never doubles a home's polling.
 

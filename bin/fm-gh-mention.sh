@@ -28,11 +28,15 @@
 # case-insensitively, by login and never by display name), and that body carries
 # one of the configured `markers` (matched case-insensitively as a literal
 # substring). The marker is what separates a request meant for firstmate from
-# ordinary conversation by a trusted account. Text quoted or embedded from
-# another account never qualifies on its own, because only the body's own author
-# is checked. Everything else is ignored silently: no record, no wake, no forge
-# write. Authorizing a collaborator is exactly adding their login to
-# `trusted_logins`, and every listed login carries the same authority.
+# ordinary conversation by a trusted account. Only the body's OWN author is
+# checked, so a marker quoted from an untrusted account never qualifies on its
+# own; a trusted collaborator who posts a body carrying a marker - including by
+# quote-reply - authored that body deliberately, and it is treated as a request,
+# which is correct rather than a gap. The one account excluded is the one this
+# home posts as, so firstmate never answers its own reply; see self_login_resolve.
+# Everything else is ignored silently: no record, no wake, no forge write.
+# Authorizing a collaborator is exactly adding their login to `trusted_logins`,
+# and every listed login carries the same authority.
 #
 # THE POLL PERFORMS NO FORGE WRITES AT ALL. It reads three repo-scoped listings
 # per repo per poll, each bounded by a `since` cursor so the cost is a small
@@ -67,10 +71,10 @@
 # on the next sweep rather than holding one forever; that clock is separate
 # from the read cursor, which a repo whose reads do not all complete keeps, so
 # nothing is skipped. The cap is what keeps the hourly cost fixed:
-# 3 x cap x (3600 / interval) calls, and a larger watched set buys a longer
-# worst-case pickup - ceil(watched / cap) x interval, which holds whether the
-# other repos read cleanly or not - rather than an exhausted allowance shared
-# with every other gh-backed plane on this host.
+# 3 x cap x 120 calls an hour, and a larger watched set buys a longer worst-case
+# pickup - ceil(watched / cap) x 30s, which holds whether the other repos read
+# cleanly or not - rather than an exhausted allowance shared with every other
+# gh-backed plane on this host.
 #
 # DURABLE STATE (all under state/, all gitignored):
 #   gh-mention-inbox/<record-id>.json          one accepted mention, pending
@@ -82,6 +86,9 @@
 #   gh-mention.reported                        the failure diagnostics the last
 #                                              poll printed, so a condition that
 #                                              outlives one poll is reported once
+#   gh-mention.unwatched                       the registered projects that
+#                                              resolved to no repo at the last
+#                                              arm, so an unchanged set is quiet
 # A record id is the mention's own GitHub identity - issue-<id> for an issue or
 # PR body, comment-<id> for a conversation comment, review-comment-<id> for a PR
 # review comment - so a repeated poll re-derives the same id and never files the
@@ -106,14 +113,14 @@
 # once, so this is loud exactly once: a `could not` line from this plane is
 # blocking, and the repo resumes from its cursor once state/ is writable again.
 #
-# RESPONSE LATENCY. An enabled plane asks the home's watcher for a sweep every
-# `check_interval` seconds (default 30) instead of the default 300, so a tagged
-# comment is picked up in tens of seconds. That request goes through the one
+# RESPONSE LATENCY. An enabled plane asks the home's watcher for a 30s sweep
+# instead of the default 300, so a tagged comment is picked up in tens of
+# seconds. That request goes through the one
 # cadence config/x-mode.env that bin/fm-bootstrap.sh already owns for Relay: a
 # home running both planes gets one interval, the fastest either asked for,
 # never two. A tight cadence is affordable because the per-poll cost is fixed at
 # three reads per capped repo; a large watched set costs pickup time rather
-# than allowance, so a longer `check_interval` buys the host headroom.
+# than allowance, and FM_GH_MENTION_MAX_REPOS is what buys the host headroom.
 #
 # Environment:
 #   FM_GH_MENTION_BUDGET    seconds one poll may spend on forge reads
@@ -124,7 +131,6 @@
 #   FM_GH_MENTION_MAX_REPOS watched repos one sweep may read (default 5); the
 #                           rest are read on the following sweeps, oldest first
 #   FM_GH_MENTION_KEEP      processed ids retained in the cursor (default 500)
-#   FM_GH_MENTION_NOW       ISO UTC clock override for tests
 set -u
 export LC_ALL=C
 
@@ -140,11 +146,14 @@ CHECK_ID=gh-mention
 INBOX="$STATE/gh-mention-inbox"
 CURSOR="$STATE/gh-mention-cursor.json"
 REPORT_RECORD="$STATE/gh-mention.reported"
+UNWATCHED_RECORD="$STATE/gh-mention.unwatched"
 LOCK="$STATE/.gh-mention.lock"
 CURSOR_SCHEMA=fm-gh-mention-cursor.v1
 RECORD_SCHEMA=fm-gh-mention.v1
 BODY_MAX=4000
+SELF_LOGIN=
 PER_PAGE=100
+WATCH_INTERVAL=30
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
@@ -175,16 +184,21 @@ diag() {  # <message>
   DIAGNOSTICS="${DIAGNOSTICS}gh-mention: $1"$'\n'
 }
 
-report_record_write() {  # <reported-text>; empty forgets what was reported
-  local staged
+report_record_read() {  # <path>
+  [ -f "$1" ] && [ ! -L "$1" ] || return 0
+  cat "$1" 2>/dev/null
+}
+
+report_record_write() {  # <path> <text>; empty text forgets what was reported
+  local path=$1 staged
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || return 1
-  if [ -z "$1" ]; then
-    rm -f -- "$REPORT_RECORD"
+  if [ -z "$2" ]; then
+    rm -f -- "$path"
     return 0
   fi
-  staged=$(umask 077; mktemp "$STATE/.gh-mention-reported.XXXXXX") || return 1
-  if ! printf '%s\n' "$1" > "$staged" || ! chmod 0600 "$staged" \
-    || ! mv -f -- "$staged" "$REPORT_RECORD"; then
+  staged=$(umask 077; mktemp "$STATE/.gh-mention-report.XXXXXX") || return 1
+  if ! printf '%s\n' "$2" > "$staged" || ! chmod 0600 "$staged" \
+    || ! mv -f -- "$staged" "$path"; then
     rm -f -- "$staged"
     return 1
   fi
@@ -197,12 +211,10 @@ report_record_write() {  # <reported-text>; empty forgets what was reported
 diag_flush() {
   local pending=${DIAGNOSTICS%$'\n'} previous=
   DIAGNOSTICS=
-  if [ -f "$REPORT_RECORD" ] && [ ! -L "$REPORT_RECORD" ]; then
-    previous=$(cat "$REPORT_RECORD" 2>/dev/null) || previous=
-  fi
+  previous=$(report_record_read "$REPORT_RECORD")
   [ "$pending" != "$previous" ] || return 0
   [ -z "$pending" ] || printf '%s\n' "$pending"
-  report_record_write "$pending" || true
+  report_record_write "$REPORT_RECORD" "$pending" || true
 }
 
 TMP=
@@ -212,12 +224,7 @@ cleanup() {
   [ -z "$TMP" ] || rm -rf -- "$TMP"
 }
 
-now_iso() {
-  case "${FM_GH_MENTION_NOW:-}" in
-    '') date -u +%Y-%m-%dT%H:%M:%SZ ;;
-    *) printf '%s\n' "$FM_GH_MENTION_NOW" ;;
-  esac
-}
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------------------------------------------------------------- config
 
@@ -235,7 +242,6 @@ config_load() {
   CFG_REPOS=
   CFG_TRUSTED_JSON='[]'
   CFG_MARKERS_JSON='[]'
-  CFG_INTERVAL=
   [ -e "$CONFIG" ] || return 1
   if [ -L "$CONFIG" ] || [ ! -f "$CONFIG" ] || [ ! -r "$CONFIG" ]; then
     CONFIG_PROBLEM='config/gh-mentions.json is not a readable regular file'
@@ -257,7 +263,6 @@ config_load() {
     'invalid: '*) CONFIG_PROBLEM="config/gh-mentions.json ${parsed#invalid: }"; return 2 ;;
   esac
   CFG_ENABLED=$(printf '%s\n' "$parsed" | sed -n '1p')
-  CFG_INTERVAL=$(printf '%s\n' "$parsed" | sed -n '2p')
   CFG_TRUSTED=$(printf '%s\n' "$parsed" | sed -n '/^--trusted$/,/^--markers$/p' | sed '1d;$d')
   CFG_MARKERS=$(printf '%s\n' "$parsed" | sed -n '/^--markers$/,/^--repos$/p' | sed '1d;$d')
   CFG_REPOS=$(printf '%s\n' "$parsed" | sed -n '/^--repos$/,$p' | sed '1d')
@@ -336,12 +341,14 @@ cursor_read() {
     && jq -e --arg s "$CURSOR_SCHEMA" '.schema == $s and (.repos|type=="object")
         and (.processed|type=="array")
         and ((.grants // {}) | type == "object") and ((.lapsed // []) | type == "array")
-        and ((.attempted // {}) | type == "object")' \
+        and ((.attempted // {}) | type == "object")
+        and ((.self_login // "") | type == "string")' \
       "$CURSOR" >/dev/null 2>&1; then
     cat "$CURSOR"
     return 0
   fi
-  jq -n --arg s "$CURSOR_SCHEMA" '{schema:$s,repos:{},processed:[],grants:{},lapsed:[],attempted:{}}'
+  jq -n --arg s "$CURSOR_SCHEMA" \
+    '{schema:$s,repos:{},processed:[],grants:{},lapsed:[],attempted:{},self_login:""}'
 }
 
 cursor_write() {  # <cursor-json-file>
@@ -544,15 +551,45 @@ grant_charge() {  # <author-login> <record-id> <cursor-json> <now-iso>
   cursor_write "$out"
 }
 
+# ---------------------------------------------------------------- self
+
+# The account this home posts as. firstmate answers a mention by commenting on
+# the thread, and a reply that restates the ask carries a marker, so without
+# this the next sweep would read that reply back as a fresh mention from a
+# trusted login and answer itself. Resolved once and remembered in the cursor.
+#
+# The trade is deliberate and narrow: the one account firstmate speaks as cannot
+# also tag it, so the captain tags from another login on `trusted_logins`. The
+# responder's no-marker reply contract is what covers a home where this cannot
+# be resolved at all.
+self_login_resolve() {  # <cursor-json>
+  local login
+  login=$(jq -r '.self_login // ""' "$1" 2>/dev/null) || return 1
+  if [ -n "$login" ]; then
+    printf '%s\n' "$login"
+    return 0
+  fi
+  login=$(fm_run_timed 5 env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+    gh api user --jq .login 2>/dev/null) || return 1
+  case "$login" in
+    ''|*[!A-Za-z0-9-]*) return 1 ;;
+  esac
+  jq --arg l "$login" '.self_login = $l' "$1" > "$TMP/self.json" \
+    && mv -f -- "$TMP/self.json" "$1"
+  printf '%s\n' "$login"
+}
+
 # ---------------------------------------------------------------- selection
 
 # The safety core, stated once and declaratively: a candidate survives only when
 # its own author is trusted AND its own body carries a configured marker.
 qualify() {  # <candidates-in> <repo> <qualified-out>
   jq -c --arg repo "$2" --argjson trusted "$LIVE_LOGINS_JSON" \
-    --argjson markers "$CFG_MARKERS_JSON" --argjson cap "$BODY_MAX" '
+    --argjson markers "$CFG_MARKERS_JSON" --argjson cap "$BODY_MAX" \
+    --arg self "$SELF_LOGIN" '
     . as $c
     | ($c.author | ascii_downcase) as $login
+    | select($self == "" or $login != ($self | ascii_downcase))
     | select(any($trusted[]; . == $login))
     | [$markers[] as $m | select(($c.body | ascii_downcase) | contains($m | ascii_downcase)) | $m] as $hit
     | select(($hit | length) > 0)
@@ -736,6 +773,9 @@ poll_cycle() {
     diag 'could not read which authorizations are still live; no mention is accepted this cycle'
     return 0
   fi
+  SELF_LOGIN=$(self_login_resolve "$state_json") || SELF_LOGIN=
+  [ -n "$SELF_LOGIN" ] \
+    || diag 'could not resolve which GitHub account this home posts as; until it resolves, a reply that carries a marker could be read back as a new mention'
   # A renewed grant becomes reportable again the next time it lapses.
   jq --argjson live "$LIVE_LOGINS_JSON" '.lapsed = (((.lapsed // []) - $live))' "$state_json" \
     > "$TMP/relive.json" && mv -f -- "$TMP/relive.json" "$state_json"
@@ -812,7 +852,6 @@ action_status() {
   cursor_read > "$TMP_STATUS"
   grants_describe "$TMP_STATUS" "$(now_iso)" | sed 's/^/  /'
   printf 'markers: %s\n' "$(printf '%s\n' "$CFG_MARKERS" | paste -sd, -)"
-  printf 'requested watcher interval: %ss\n' "$CFG_INTERVAL"
   unwatched_projects | sed 's/^/unwatched: /'
   repos=$(watched_repos)
   if [ -z "$repos" ]; then
@@ -837,7 +876,23 @@ action_cadence() {
   [ "$rc" -eq 0 ] || return 0
   [ "$CFG_ENABLED" = true ] || return 0
   [ -n "$(watched_repos)" ] || return 0
-  printf '%s\n' "$CFG_INTERVAL"
+  printf '%s\n' "$WATCH_INTERVAL"
+}
+
+# A registered project on another forge, or cloned elsewhere, is an ordinary
+# steady state rather than a fault, so session start hears about it when the set
+# CHANGES rather than on every start; `status` lists the whole set on demand.
+unwatched_report() {
+  local current previous line
+  current=$(unwatched_projects)
+  previous=$(report_record_read "$UNWATCHED_RECORD")
+  [ "$current" != "$previous" ] || return 0
+  while IFS= read -r line; do
+    [ -z "$line" ] || say "$line"
+  done <<EOF
+$current
+EOF
+  report_record_write "$UNWATCHED_RECORD" "$current" || true
 }
 
 action_arm() {
@@ -852,7 +907,7 @@ action_arm() {
   [ "$CFG_ENABLED" = true ] || return 1
   fm_check_shim_arm "$STATE" "$CHECK_ID" "$SCRIPT_DIR/fm-gh-mention.sh" \
     'GitHub mention poll shim' "$FM_HOME" || return 1
-  unwatched_projects | while IFS= read -r line; do say "$line"; done
+  unwatched_report
   [ -n "$(watched_repos)" ] \
     || say 'nothing to watch yet - no project registered here resolves to a GitHub repository and config/gh-mentions.json lists no repos'
 }
@@ -862,7 +917,7 @@ action_arm() {
 # mentions the home has already seen. What was already reported does not
 # survive, so a condition still standing at the re-arm is reported again.
 action_disarm() {
-  fm_check_shim_disarm "$STATE" "$CHECK_ID" "$REPORT_RECORD"
+  fm_check_shim_disarm "$STATE" "$CHECK_ID" "$REPORT_RECORD" "$UNWATCHED_RECORD"
 }
 
 trap cleanup EXIT
