@@ -903,6 +903,35 @@ test_a_persistent_failure_is_reported_once() {
   pass "fm-gh-mention: a persistent failure is reported once, and again only if it returns"
 }
 
+# A sweep evaluates only the repositories the cap let it reach, so a standing
+# failure in the rotating tail must not alternate between present and absent:
+# the watcher wakes firstmate on any output at all, so a flapping diagnostic is
+# a wake every other sweep forever.
+test_a_standing_failure_survives_the_sweep_rotation() {
+  local home out n standing=0 fresh=0
+  home=$(make_home rotating-failure \
+    '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/bad","o/good"]}')
+  printf '%s\n' o/bad > "$home/gh/unreadable"
+  for n in 1 2 3 4; do
+    out=$(FM_GH_MENTION_MAX_REPOS=1 run_plane "$home" poll 2>&1)
+    case "$out" in *'could not read o/bad'*) standing=$((standing + 1)) ;; esac
+  done
+  assert_equals 1 "$standing" \
+    "a standing failure the sweep cap keeps skipping is reported once, not once per rotation"
+
+  # Retaining that report must not silence a repository that starts failing now.
+  printf '%s\n' o/good >> "$home/gh/unreadable"
+  standing=0
+  for n in 1 2 3 4; do
+    out=$(FM_GH_MENTION_MAX_REPOS=1 run_plane "$home" poll 2>&1)
+    case "$out" in *'could not read o/good'*) fresh=$((fresh + 1)) ;; esac
+    case "$out" in *'could not read o/bad'*) standing=$((standing + 1)) ;; esac
+  done
+  assert_equals 1 "$fresh" "a failure that appears in another repository is still reported"
+  assert_equals 0 "$standing" "the older failure stays silent while the new one is reported"
+  pass "fm-gh-mention: a standing failure is reported once across the sweep rotation"
+}
+
 # A mention that qualified but could not be filed must be genuinely re-derived,
 # which only happens if its repo's cursor does not step over the window it was in.
 test_an_unfiled_mention_keeps_the_repo_cursor() {
@@ -1034,6 +1063,7 @@ test_the_plane_requests_a_fast_watcher_cadence
 test_a_full_page_stops_the_cursor_where_the_read_stopped
 test_a_failed_read_keeps_the_repo_cursor
 test_a_persistent_failure_is_reported_once
+test_a_standing_failure_survives_the_sweep_rotation
 test_an_unfiled_mention_keeps_the_repo_cursor
 test_subject_type_comes_from_the_kind_segment
 test_a_sweep_reads_at_most_the_capped_number_of_repositories

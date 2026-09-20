@@ -725,8 +725,9 @@ Generated state, all under `state/` and gitignored:
 - `gh-mention-inbox/<record-id>.json` - one accepted mention awaiting firstmate, and `gh-mention-inbox/handled/` for the same record after `bin/fm-gh-mention.sh ack`.
 - `gh-mention-cursor.json` - each watched repository's read cursor, the attempt clock that orders sweeps, and the bounded list of mention ids already filed.
   It survives `disarm`, so re-arming resumes where the plane left off.
-- `gh-mention.reported` - the failure diagnostics the last poll printed.
+- `gh-mention.reported` - every failure still standing after the last poll, keyed by the repository it belongs to, or by the whole cycle for a condition that is not about one repository.
   The watcher wakes firstmate on any check output, so a condition that outlives one poll - an unreadable repository, a missing tool, a broken configuration - is reported once rather than on every cycle, and is reported again if it clears and returns.
+  The key is what makes that hold across the sweep cap: a sweep learns nothing about the repositories it did not reach, so it leaves their entries alone instead of treating an unvisited repository as recovered and reporting it again on the sweep that comes back to it.
   Unlike the cursor it does not survive `disarm`, so a condition still standing when the plane is re-armed is reported again.
 - `gh-mention.watched-set` - what the last arm said about the watched set, so session start reports a registered project it cannot watch, or a watched set that is still empty, only when that picture changes.
 - `gh-mention.check.sh` and `gh-mention.check-trust` - the standing poll shim and its watcher trust binding.

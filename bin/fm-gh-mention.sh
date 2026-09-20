@@ -84,9 +84,11 @@
 #                                              per-repo attempt clock that
 #                                              orders sweeps, and the bounded
 #                                              processed-id list
-#   gh-mention.reported                        the failure diagnostics the last
-#                                              poll printed, so a condition that
-#                                              outlives one poll is reported once
+#   gh-mention.reported                        one scope-keyed line per failure
+#                                              standing after the last poll, so
+#                                              a condition that outlives one
+#                                              poll - or the sweep cap skipping
+#                                              its repo - is reported once
 #   gh-mention.watched-set                     what the last arm said about the
 #                                              watched set, so an unchanged
 #                                              picture is quiet every session
@@ -184,10 +186,34 @@ die() { printf 'fm-gh-mention: %s\n' "$1" >&2; exit 2; }
 # Diagnostics therefore go to diag() and are flushed once at the end of a poll;
 # news (an accepted mention, a grant that just lapsed) is a one-off event that
 # always prints through say().
+#
+# Every diagnostic is filed under the SCOPE whose condition it describes: a
+# watched repo, or POLL_SCOPE for a whole-cycle condition - a repo scope is
+# always owner/name, so the two can never collide. That is what makes
+# report-once survive the sweep cap. A sweep reads at most
+# FM_GH_MENTION_MAX_REPOS repos, so it learns nothing about the ones it skipped,
+# and a record keyed by nothing but the whole blob would show a standing failure
+# in the rotating tail as cleared on every sweep that skips it and as new on
+# every sweep that reaches it - a wake every other cycle, forever. So a repo
+# this sweep evaluated is replaced by what that sweep found, a repo it never
+# reached keeps what was reported for it, and a repo that is no longer watched
+# is forgotten. A whole-cycle condition is re-derived on every poll, because
+# every poll that gets far enough to have one evaluates it.
+POLL_SCOPE=poll
 DIAGNOSTICS=
+DIAG_WATCHED=
+DIAG_EVALUATED=
 
-diag() {  # <message>
-  DIAGNOSTICS="${DIAGNOSTICS}gh-mention: $1"$'\n'
+diag() {  # <scope> <message>
+  DIAGNOSTICS="${DIAGNOSTICS}$1"$'\t'"gh-mention: $2"$'\n'
+  diag_evaluated "$1"
+}
+
+# This sweep learned <scope>'s condition, so what was reported for it last time
+# is replaced rather than carried forward. A read the budget or a refused
+# allowance cut short learns nothing about its repo and must not call this.
+diag_evaluated() {  # <scope>
+  DIAG_EVALUATED="${DIAG_EVALUATED}$1"$'\n'
 }
 
 report_record_read() {  # <path>
@@ -210,17 +236,38 @@ report_record_write() {  # <path> <text>; empty text forgets what was reported
   fi
 }
 
-# Print this poll's diagnostics unless the last poll already reported exactly
-# them, then record what was reported. A condition that clears is forgotten, so
-# it is reported again if it returns. Reporting before recording makes a record
-# that cannot be written cost a repeated report rather than a lost one.
+# The conditions this poll found that the last record does not already hold.
+diag_unreported() {  # <previous-record> <pending>
+  printf '%s\n' "$2" | awk -F'\t' '
+    NR == FNR { reported[$0] = 1; next }
+    $0 != "" && !($0 in reported) { print $2 }' <(printf '%s\n' "$1") -
+}
+
+# What the record holds for a watched repo this sweep never evaluated. That is
+# what must survive into the new record, or the next sweep that reaches the repo
+# reports its standing failure all over again.
+diag_retained() {  # <previous-record>
+  printf '%s\n' "$1" | awk -F'\t' -v watched="$DIAG_WATCHED" -v evaluated="$DIAG_EVALUATED" '
+    BEGIN {
+      split(watched, w, "\n"); for (i in w) if (w[i] != "") is_watched[w[i]] = 1
+      split(evaluated, e, "\n"); for (i in e) if (e[i] != "") is_evaluated[e[i]] = 1
+    }
+    $0 != "" && ($1 in is_watched) && !($1 in is_evaluated)'
+}
+
+# Print what the last record does not already hold, then record everything that
+# is standing now. A condition that clears is forgotten, so it is reported again
+# if it returns. Reporting before recording makes a record that cannot be
+# written cost a repeated report rather than a lost one.
 diag_flush() {
-  local pending=${DIAGNOSTICS%$'\n'} previous=
+  local pending=${DIAGNOSTICS%$'\n'} previous new standing
   DIAGNOSTICS=
   previous=$(report_record_read "$REPORT_RECORD")
-  [ "$pending" != "$previous" ] || return 0
-  [ -z "$pending" ] || printf '%s\n' "$pending"
-  report_record_write "$REPORT_RECORD" "$pending" || true
+  new=$(diag_unreported "$previous" "$pending")
+  standing=$(printf '%s\n%s\n' "$(diag_retained "$previous")" "$pending" | sed '/^$/d' | sort)
+  [ -z "$new" ] || printf '%s\n' "$new"
+  [ "$standing" != "$previous" ] || return 0
+  report_record_write "$REPORT_RECORD" "$standing" || true
 }
 
 TMP=
@@ -287,7 +334,7 @@ config_require() {
   case "$rc" in
     0) return 0 ;;
     1) return 1 ;;
-    *) diag "$CONFIG_PROBLEM"; return 2 ;;
+    *) diag "$POLL_SCOPE" "$CONFIG_PROBLEM"; return 2 ;;
   esac
 }
 
@@ -669,14 +716,17 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
     && mv -f -- "$TMP/attempt.json" "$out"
   if ! read_repo "$repo" "$since" "$TMP/candidates.jsonl" "$TMP/bound"; then
     if [ "$RATE_LIMITED" -eq 1 ]; then
-      diag "GitHub refused this host's API allowance, so this cycle stopped at the refused call; every gh-backed plane on this host is affected until the allowance resets"
+      diag "$POLL_SCOPE" "GitHub refused this host's API allowance, so this cycle stopped at the refused call; every gh-backed plane on this host is affected until the allowance resets"
     elif [ "$BUDGET_EXHAUSTED" -eq 0 ]; then
-      diag "could not read $repo this cycle; it is retried next cycle"
+      diag "$repo" "could not read $repo this cycle; it is retried next cycle"
     fi
     return 1
   fi
+  # The reads completed, so whatever was reported for this repo before was
+  # either found again above or is genuinely gone.
+  diag_evaluated "$repo"
   if ! qualify "$TMP/candidates.jsonl" "$repo" "$TMP/qualified.jsonl"; then
-    diag "could not read $repo's new activity; it is retried next cycle"
+    diag "$repo" "could not read $repo's new activity; it is retried next cycle"
     return 1
   fi
   jq -c --slurpfile c "$state_json" '
@@ -694,7 +744,7 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
     case "$charge" in
       0) ;;
       2) continue ;;
-      *) diag "could not durably record a bounded authorization being spent; this mention is not accepted"
+      *) diag "$repo" "could not durably record a bounded authorization being spent; this mention is not accepted"
          unfiled=1
          continue ;;
     esac
@@ -704,7 +754,7 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
         '.processed = ((.processed - [$id]) + [$id] | .[-$keep:])' "$out" > "$TMP/next.json" \
         && mv -f -- "$TMP/next.json" "$out"
     else
-      diag "could not file a mention from $repo; it stays unfiled until the next cycle"
+      diag "$repo" "could not file a mention from $repo; it stays unfiled until the next cycle"
       unfiled=1
     fi
   done < "$TMP/new.jsonl"
@@ -732,8 +782,8 @@ poll_cycle() {
   local start repos repo state_json next swept
   config_require || return 0
   [ "$CFG_ENABLED" = true ] || return 0
-  command -v gh >/dev/null 2>&1 || { diag 'gh is required to read watched repositories'; return 0; }
-  command -v jq >/dev/null 2>&1 || { diag 'jq is required to read watched repositories'; return 0; }
+  command -v gh >/dev/null 2>&1 || { diag "$POLL_SCOPE" 'gh is required to read watched repositories'; return 0; }
+  command -v jq >/dev/null 2>&1 || { diag "$POLL_SCOPE" 'jq is required to read watched repositories'; return 0; }
   resolve_budget
   acquire
   TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-gh-mention.XXXXXX") || die 'no scratch directory'
@@ -743,7 +793,7 @@ poll_cycle() {
   BACKFILL_SINCE=$(iso_shift "$start" "${FM_GH_MENTION_BACKFILL:-3600}") || BACKFILL_SINCE=
   OVERLAP_SINCE=$(iso_shift "$start" 60) || OVERLAP_SINCE=
   if [ -z "$BACKFILL_SINCE" ] || [ -z "$OVERLAP_SINCE" ]; then
-    diag "cannot read the clock as a UTC timestamp ($start)"
+    diag "$POLL_SCOPE" "cannot read the clock as a UTC timestamp ($start)"
     return 0
   fi
   KEEP=${FM_GH_MENTION_KEEP:-500}
@@ -752,6 +802,7 @@ poll_cycle() {
   case "$MAX_REPOS" in ''|*[!0-9]*|0) MAX_REPOS=5 ;; esac
   repos=$(watched_repos)
   [ -n "$repos" ] || return 0
+  DIAG_WATCHED=$repos
   mkdir -p "$INBOX" || die 'mention inbox unavailable'
   DEADLINE=$(( $(date +%s) + BUDGET ))
   state_json="$TMP/cursor.json"
@@ -760,7 +811,7 @@ poll_cycle() {
   LIVE_LOGINS_JSON=$(grants_live "$state_json" "$start" \
     | jq -Rsc 'split("\n") | map(select(length > 0))') || LIVE_LOGINS_JSON=
   if [ -z "$LIVE_LOGINS_JSON" ]; then
-    diag 'could not read which authorizations are still live; no mention is accepted this cycle'
+    diag "$POLL_SCOPE" 'could not read which authorizations are still live; no mention is accepted this cycle'
     return 0
   fi
   # A renewed grant becomes reportable again the next time it lapses.
@@ -777,7 +828,7 @@ poll_cycle() {
     mv -f -- "$next" "$state_json"
     [ "$BUDGET_EXHAUSTED" -eq 0 ] && [ "$RATE_LIMITED" -eq 0 ] || break
   done < <(order_by_attempt "$state_json" "$repos")
-  cursor_write "$state_json" || diag 'could not record how far the watched repositories were read'
+  cursor_write "$state_json" || diag "$POLL_SCOPE" 'could not record how far the watched repositories were read'
   return 0
 }
 
