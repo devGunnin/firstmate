@@ -32,8 +32,9 @@
 # checked, so a marker quoted from an untrusted account never qualifies on its
 # own; a trusted collaborator who posts a body carrying a marker - including by
 # quote-reply - authored that body deliberately, and it is treated as a request,
-# which is correct rather than a gap. The one account excluded is the one this
-# home posts as, so firstmate never answers its own reply; see self_login_resolve.
+# which is correct rather than a gap. The one body kind excluded is firstmate's
+# own reply, recognized by the REPLY_STAMP it begins with rather than by who
+# posted it, so every authorized account stays able to tag.
 # Everything else is ignored silently: no record, no wake, no forge write.
 # Authorizing a collaborator is exactly adding their login to `trusted_logins`,
 # and every listed login carries the same authority.
@@ -86,9 +87,9 @@
 #   gh-mention.reported                        the failure diagnostics the last
 #                                              poll printed, so a condition that
 #                                              outlives one poll is reported once
-#   gh-mention.unwatched                       the registered projects that
-#                                              resolved to no repo at the last
-#                                              arm, so an unchanged set is quiet
+#   gh-mention.watched-set                     what the last arm said about the
+#                                              watched set, so an unchanged
+#                                              picture is quiet every session
 # A record id is the mention's own GitHub identity - issue-<id> for an issue or
 # PR body, comment-<id> for a conversation comment, review-comment-<id> for a PR
 # review comment - so a repeated poll re-derives the same id and never files the
@@ -146,12 +147,16 @@ CHECK_ID=gh-mention
 INBOX="$STATE/gh-mention-inbox"
 CURSOR="$STATE/gh-mention-cursor.json"
 REPORT_RECORD="$STATE/gh-mention.reported"
-UNWATCHED_RECORD="$STATE/gh-mention.unwatched"
+WATCHED_SET_RECORD="$STATE/gh-mention.watched-set"
 LOCK="$STATE/.gh-mention.lock"
 CURSOR_SCHEMA=fm-gh-mention-cursor.v1
 RECORD_SCHEMA=fm-gh-mention.v1
 BODY_MAX=4000
-SELF_LOGIN=
+# What firstmate's own public replies begin with. The responder contract writes
+# it; the poll reads it back and never treats a body carrying it as a request,
+# which is what stops firstmate answering its own reply. It is an HTML comment,
+# so it renders as nothing on the forge.
+REPLY_STAMP='<!-- firstmate:gh-mention -->'
 PER_PAGE=100
 WATCH_INTERVAL=30
 
@@ -342,13 +347,13 @@ cursor_read() {
         and (.processed|type=="array")
         and ((.grants // {}) | type == "object") and ((.lapsed // []) | type == "array")
         and ((.attempted // {}) | type == "object")
-        and ((.self_login // "") | type == "string")' \
+        ' \
       "$CURSOR" >/dev/null 2>&1; then
     cat "$CURSOR"
     return 0
   fi
   jq -n --arg s "$CURSOR_SCHEMA" \
-    '{schema:$s,repos:{},processed:[],grants:{},lapsed:[],attempted:{},self_login:""}'
+    '{schema:$s,repos:{},processed:[],grants:{},lapsed:[],attempted:{}}'
 }
 
 cursor_write() {  # <cursor-json-file>
@@ -551,45 +556,24 @@ grant_charge() {  # <author-login> <record-id> <cursor-json> <now-iso>
   cursor_write "$out"
 }
 
-# ---------------------------------------------------------------- self
-
-# The account this home posts as. firstmate answers a mention by commenting on
-# the thread, and a reply that restates the ask carries a marker, so without
-# this the next sweep would read that reply back as a fresh mention from a
-# trusted login and answer itself. Resolved once and remembered in the cursor.
-#
-# The trade is deliberate and narrow: the one account firstmate speaks as cannot
-# also tag it, so the captain tags from another login on `trusted_logins`. The
-# responder's no-marker reply contract is what covers a home where this cannot
-# be resolved at all.
-self_login_resolve() {  # <cursor-json>
-  local login
-  login=$(jq -r '.self_login // ""' "$1" 2>/dev/null) || return 1
-  if [ -n "$login" ]; then
-    printf '%s\n' "$login"
-    return 0
-  fi
-  login=$(fm_run_timed 5 env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
-    gh api user --jq .login 2>/dev/null) || return 1
-  case "$login" in
-    ''|*[!A-Za-z0-9-]*) return 1 ;;
-  esac
-  jq --arg l "$login" '.self_login = $l' "$1" > "$TMP/self.json" \
-    && mv -f -- "$TMP/self.json" "$1"
-  printf '%s\n' "$login"
-}
-
 # ---------------------------------------------------------------- selection
 
 # The safety core, stated once and declaratively: a candidate survives only when
-# its own author is trusted AND its own body carries a configured marker.
+# its own author is trusted AND its own body carries a configured marker AND
+# that body is not one firstmate wrote itself.
+#
+# Its own reply is recognized by the stamp it begins with, never by who posted
+# it: a home signs in as whatever account the captain gave it, and every account
+# on `trusted_logins` must stay able to tag. The stamp counts only at the START
+# of a body, so quoting an earlier reply and adding a real request is still a
+# request - which is the common case on a thread firstmate is already on.
 qualify() {  # <candidates-in> <repo> <qualified-out>
   jq -c --arg repo "$2" --argjson trusted "$LIVE_LOGINS_JSON" \
     --argjson markers "$CFG_MARKERS_JSON" --argjson cap "$BODY_MAX" \
-    --arg self "$SELF_LOGIN" '
+    --arg stamp "$REPLY_STAMP" '
     . as $c
+    | select(($c.body | sub("^[[:space:]]+"; "") | startswith($stamp)) | not)
     | ($c.author | ascii_downcase) as $login
-    | select($self == "" or $login != ($self | ascii_downcase))
     | select(any($trusted[]; . == $login))
     | [$markers[] as $m | select(($c.body | ascii_downcase) | contains($m | ascii_downcase)) | $m] as $hit
     | select(($hit | length) > 0)
@@ -773,9 +757,6 @@ poll_cycle() {
     diag 'could not read which authorizations are still live; no mention is accepted this cycle'
     return 0
   fi
-  SELF_LOGIN=$(self_login_resolve "$state_json") || SELF_LOGIN=
-  [ -n "$SELF_LOGIN" ] \
-    || diag 'could not resolve which GitHub account this home posts as; until it resolves, a reply that carries a marker could be read back as a new mention'
   # A renewed grant becomes reportable again the next time it lapses.
   jq --argjson live "$LIVE_LOGINS_JSON" '.lapsed = (((.lapsed // []) - $live))' "$state_json" \
     > "$TMP/relive.json" && mv -f -- "$TMP/relive.json" "$state_json"
@@ -852,6 +833,7 @@ action_status() {
   cursor_read > "$TMP_STATUS"
   grants_describe "$TMP_STATUS" "$(now_iso)" | sed 's/^/  /'
   printf 'markers: %s\n' "$(printf '%s\n' "$CFG_MARKERS" | paste -sd, -)"
+  printf 'reply stamp: %s\n' "$REPLY_STAMP"
   unwatched_projects | sed 's/^/unwatched: /'
   repos=$(watched_repos)
   if [ -z "$repos" ]; then
@@ -879,20 +861,26 @@ action_cadence() {
   printf '%s\n' "$WATCH_INTERVAL"
 }
 
-# A registered project on another forge, or cloned elsewhere, is an ordinary
-# steady state rather than a fault, so session start hears about it when the set
-# CHANGES rather than on every start; `status` lists the whole set on demand.
-unwatched_report() {
+# A registered project on another forge or cloned elsewhere, and a watched set
+# that is still empty, are ordinary steady states rather than faults. Session
+# start hears them when they CHANGE rather than on every start, so an unchanging
+# line can never force a skill load every session; `status` lists the whole
+# picture on demand either way.
+watched_set_report() {
   local current previous line
-  current=$(unwatched_projects)
-  previous=$(report_record_read "$UNWATCHED_RECORD")
+  current=$(
+    unwatched_projects
+    [ -n "$(watched_repos)" ] \
+      || printf '%s\n' 'nothing to watch yet - no project registered here resolves to a GitHub repository and config/gh-mentions.json lists no repos'
+  )
+  previous=$(report_record_read "$WATCHED_SET_RECORD")
   [ "$current" != "$previous" ] || return 0
   while IFS= read -r line; do
     [ -z "$line" ] || say "$line"
   done <<EOF
 $current
 EOF
-  report_record_write "$UNWATCHED_RECORD" "$current" || true
+  report_record_write "$WATCHED_SET_RECORD" "$current" || true
 }
 
 action_arm() {
@@ -907,9 +895,7 @@ action_arm() {
   [ "$CFG_ENABLED" = true ] || return 1
   fm_check_shim_arm "$STATE" "$CHECK_ID" "$SCRIPT_DIR/fm-gh-mention.sh" \
     'GitHub mention poll shim' "$FM_HOME" || return 1
-  unwatched_report
-  [ -n "$(watched_repos)" ] \
-    || say 'nothing to watch yet - no project registered here resolves to a GitHub repository and config/gh-mentions.json lists no repos'
+  watched_set_report
 }
 
 # The read cursor survives a disarm on purpose: re-arming then resumes where
@@ -917,7 +903,7 @@ action_arm() {
 # mentions the home has already seen. What was already reported does not
 # survive, so a condition still standing at the re-arm is reported again.
 action_disarm() {
-  fm_check_shim_disarm "$STATE" "$CHECK_ID" "$REPORT_RECORD" "$UNWATCHED_RECORD"
+  fm_check_shim_disarm "$STATE" "$CHECK_ID" "$REPORT_RECORD" "$WATCHED_SET_RECORD"
 }
 
 trap cleanup EXIT

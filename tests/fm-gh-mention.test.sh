@@ -23,21 +23,8 @@ mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/gh" <<'FAKE'
 #!/usr/bin/env bash
 # Fake gh for the mention plane's tests: canned listings plus a request log.
-is_user=0
-for arg in "$@"; do
-  [ "$arg" != user ] || is_user=1
-  last=$arg
-done
+for arg in "$@"; do last=$arg; done
 path=${last%%\?*}
-# The signed-in account, resolved once per poll. It is not a repository read, so
-# it stays out of paths.log, which is how the per-sweep read count is asserted.
-if [ "$is_user" = 1 ]; then
-  login=signed-in-bot
-  [ ! -f "$FM_TEST_GH_DIR/self-login" ] || login=$(cat "$FM_TEST_GH_DIR/self-login")
-  [ "$login" != fail ] || exit 1
-  printf '%s\n' "$login"
-  exit 0
-fi
 printf '%s\n' "$path" >> "$FM_TEST_GH_DIR/paths.log"
 case "$path" in
   */issues/comments) kind=comments ;;
@@ -224,50 +211,70 @@ test_a_body_opened_while_the_cursor_was_behind_is_still_filed() {
   pass "fm-gh-mention: a body opened while the cursor was behind is still filed"
 }
 
-# firstmate answers a mention by commenting on the thread as the signed-in
-# account, and a reply that restates the ask carries a marker. Without excluding
-# that account the next sweep reads the reply back as a fresh mention and
-# firstmate answers itself, in public, on someone else's thread.
-test_a_comment_from_the_account_this_home_posts_as_never_qualifies() {
-  local home
-  home=$(make_home self-reply '{"enabled":true,"trusted_logins":["mengsig","devGunnin"],"repos":["o/r"]}')
-  printf 'mengsig\n' > "$home/gh/self-login"
+# firstmate answers a mention by commenting on the thread, and a reply that
+# restates the ask carries a marker, so without the stamp the next sweep would
+# read that reply back as a fresh mention and answer itself in public. The stamp
+# is what the poll enforces, and it works whichever account this home posts as.
+test_a_stamped_reply_never_qualifies() {
+  local home stamp
+  home=$(make_home stamped '{"enabled":true,"trusted_logins":["mengsig","devGunnin"],"repos":["o/r"]}')
+  stamp=$(run_plane "$home" status | sed -n 's/^reply stamp: //p')
+  [ -n "$stamp" ] || fail "status must publish the stamp the responder has to write"
   canned "$home" o/r comments \
-    "[$(comment 501 mengsig 'you asked @firstmate to fix the parser; it is under way' \
-      'https://github.com/o/r/issues/1#issuecomment-501'),
-      $(comment 502 devGunnin '@firstmate please look at this' \
-        'https://github.com/o/r/issues/1#issuecomment-502')]"
+    "[$(comment 501 mengsig "$stamp
 
-  run_plane "$home" poll >/dev/null 2>&1
-
-  assert_absent "$home/state/gh-mention-inbox/comment-501.json" \
-    "a marker-bearing comment from the account this home posts as must never qualify"
-  assert_present "$home/state/gh-mention-inbox/comment-502.json" \
-    "another trusted account tagging the same thread is still picked up"
-  assert_equals 1 "$(wakes_in "$home")" "exactly the one real mention is queued"
-  assert_equals mengsig "$(jq -r '.self_login' "$home/state/gh-mention-cursor.json")" \
-    "the account is resolved once and remembered"
-  pass "fm-gh-mention: a comment from the account this home posts as never qualifies"
-}
-
-# The responder's reply contract is "no configured marker in a public reply".
-# What that contract has to buy is that a reply written to it cannot re-trigger
-# the plane, so the reply text is put back through the real poll to prove it.
-test_a_reply_written_to_the_contract_cannot_retrigger_the_plane() {
-  local home
-  home=$(make_home reply-contract '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/r"]}')
-  # No self-login resolution here, so only the contract itself is in play.
-  printf 'fail\n' > "$home/gh/self-login"
-  canned "$home" o/r comments \
-    "[$(comment 601 mengsig 'Picked up the request above; a fix branch is pushed and the merge is the captain call.' \
-      'https://github.com/o/r/issues/2#issuecomment-601')]"
+Picked up the request above; a fix branch is pushed and @captain owns the merge." \
+      'https://github.com/o/r/issues/1#issuecomment-501')]"
 
   run_plane "$home" poll >/dev/null 2>&1
 
   assert_equals 0 "$(records_in "$home")" \
-    "a reply that names no marker cannot be read back as a new mention"
+    "a reply that begins with the stamp must never be read back as a request"
   assert_equals 0 "$(wakes_in "$home")" "and queues no wake"
-  pass "fm-gh-mention: a reply written to the no-marker contract cannot re-trigger the plane"
+  pass "fm-gh-mention: a reply that begins with the stamp never qualifies"
+}
+
+# The exclusion is by what firstmate writes, not by who posts it, so every
+# authorized account stays able to tag however this home is signed in.
+test_every_authorized_account_can_still_tag() {
+  local home
+  home=$(make_home every-account '{"enabled":true,"trusted_logins":["mengsig","devGunnin"],"repos":["o/r"]}')
+  canned "$home" o/r comments \
+    "[$(comment 511 mengsig '@firstmate please fix the parser' \
+      'https://github.com/o/r/issues/1#issuecomment-511'),
+      $(comment 512 devGunnin '@firstmate and please look at this one' \
+        'https://github.com/o/r/issues/2#issuecomment-512')]"
+
+  run_plane "$home" poll >/dev/null 2>&1
+
+  assert_present "$home/state/gh-mention-inbox/comment-511.json" \
+    "the first authorized account can tag"
+  assert_present "$home/state/gh-mention-inbox/comment-512.json" \
+    "the second authorized account can tag too"
+  assert_equals 2 "$(wakes_in "$home")" "each tag queues its own wake"
+  pass "fm-gh-mention: every authorized account can still tag"
+}
+
+# The stamp counts only at the start of a body, so it protects the reply it
+# opens and nothing else: quoting that reply and adding a real request is the
+# ordinary way a thread continues, and it must still be heard.
+test_a_stamped_reply_quoted_inside_a_request_still_qualifies() {
+  local home stamp
+  home=$(make_home stamp-quoted '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/r"]}')
+  stamp=$(run_plane "$home" status | sed -n 's/^reply stamp: //p')
+  canned "$home" o/r comments \
+    "[$(comment 521 mengsig "> $stamp
+> Picked up the request above.
+
+That fix missed the nested case - @firstmate please take another look." \
+      'https://github.com/o/r/issues/3#issuecomment-521')]"
+
+  run_plane "$home" poll >/dev/null 2>&1
+
+  assert_present "$home/state/gh-mention-inbox/comment-521.json" \
+    "quoting a stamped reply and adding a real request is still a request"
+  assert_equals 1 "$(wakes_in "$home")" "the quoted-and-asked request queues its wake"
+  pass "fm-gh-mention: a stamped reply quoted inside a request still qualifies"
 }
 
 test_help_and_usage() {
@@ -527,11 +534,22 @@ test_an_empty_watched_set_says_there_is_nothing_to_watch() {
   out=$(run_plane "$home" status 2>&1)
   assert_contains "$out" "nothing to watch" "status says plainly that there is nothing to watch"
   out=$(run_plane "$home" arm 2>&1)
-  assert_contains "$out" "nothing to watch" "arming says plainly that there is nothing to watch"
+  assert_contains "$out" "nothing to watch" "the first arm says plainly that there is nothing to watch"
   assert_present "$home/state/gh-mention.check.sh" "the shim is still armed for repos registered later"
+  out=$(run_plane "$home" arm 2>&1)
+  assert_not_contains "$out" "nothing to watch" \
+    "an unchanged empty watched set is a steady state and says nothing on a later arm"
+  assert_contains "$(run_plane "$home" status 2>&1)" "nothing to watch" \
+    "status still says it on demand"
   out=$(run_plane "$home" poll 2>&1)
   [ -z "$out" ] || fail "a poll with nothing to watch must stay silent: $out"
   assert_absent "$home/gh/paths.log" "a poll with nothing to watch makes no forge read"
+
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/one"]}' \
+    > "$home/config/gh-mentions.json"
+  out=$(run_plane "$home" arm 2>&1)
+  assert_not_contains "$out" "nothing to watch" \
+    "a watched set that filled up says nothing about having been empty"
   pass "fm-gh-mention: an empty watched set is reported rather than polled silently"
 }
 
@@ -992,5 +1010,6 @@ test_unreadable_repos_do_not_starve_a_healthy_one
 test_an_old_body_bumped_by_new_activity_is_not_a_new_mention
 test_a_newly_opened_body_cut_off_from_page_one_is_still_filed
 test_a_body_opened_while_the_cursor_was_behind_is_still_filed
-test_a_comment_from_the_account_this_home_posts_as_never_qualifies
-test_a_reply_written_to_the_contract_cannot_retrigger_the_plane
+test_a_stamped_reply_never_qualifies
+test_every_authorized_account_can_still_tag
+test_a_stamped_reply_quoted_inside_a_request_still_qualifies

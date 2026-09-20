@@ -60,11 +60,15 @@ An account can be compromised and a public thread can be seeded by anyone, so a 
    Write for a public thread: say what was understood, what is being done or was done, and what remains the captain's call.
    Never quote internal records, task ids, paths, or firstmate's own machinery into a public comment.
 
-   **A public reply must not contain any configured marker.**
+   **Begin every public reply with this home's reply stamp, on its own first line.**
+   `bin/fm-gh-mention.sh status` prints it as `reply stamp: <...>`; copy it from there rather than from memory.
+   It is an HTML comment, so it renders as nothing on the thread, and the poll drops any body that starts with it - which is what stops firstmate reading its own reply back as a fresh request and answering itself in public.
+   It only counts at the **start** of a body, so it protects the reply it opens and nothing else: a person who quotes that reply and adds a real request is still heard.
+
+   **A public reply must also not contain any configured marker.**
    Not `@firstmate`, not `@captain`, not whatever `markers` this home is running - not even quoting the request back.
    Say "the request" or "your note above" instead.
-   A reply is posted by the account this home signs in as, and the poll reads every comment in the thread on its next sweep; a reply carrying a marker is a tagged comment on a watched repository, which is how firstmate ends up answering itself in public.
-   The poll excludes its own account for exactly this reason, so this rule is the second lock rather than the only one: keep it even when you believe the first one holds.
+   This is the second lock: the stamp is what the poll enforces, and this is what keeps a reply harmless if the stamp is ever dropped or mangled in transit.
 
 6. **Link any spawned work to the record** so the thread can be closed later: name the mention's record id in the backlog item's note, and name the subject URL in the brief's context, so whoever finishes the work knows which thread is waiting on it.
 
