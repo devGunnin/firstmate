@@ -33,6 +33,10 @@ case "$path" in
   *) printf '[]\n'; exit 0 ;;
 esac
 repo=$(printf '%s' "$path" | sed -n 's|^repos/\([^/]*\)/\([^/]*\)/.*|\1__\2|p')
+if [ -f "$FM_TEST_GH_DIR/unreadable" ] && grep -Fxq "${repo/__//}" "$FM_TEST_GH_DIR/unreadable"; then
+  printf '%s\n' '{"message":"Not Found","documentation_url":"https://docs.github.com/rest"}'
+  exit 1
+fi
 if [ -f "$FM_TEST_GH_DIR/ratelimit" ]; then
   printf '%s\n' '{"message":"API rate limit exceeded for user ID 1.","documentation_url":"https://docs.github.com/rest/overview/rate-limits"}'
   exit 1
@@ -80,6 +84,36 @@ records_in() { find "$1/state/gh-mention-inbox" -maxdepth 1 -name '*.json' 2>/de
 # asserts the record's contract rather than its formatting.
 field() { jq -r "$2" "$1"; }
 wakes_in() { grep -c 'check: gh-mention' "$1/state/.wake-queue" 2>/dev/null || printf '0\n'; }
+
+# Ordering is by attempt, not by success, so repositories this host cannot read
+# cost their slot once per rotation instead of pinning themselves to the front
+# of every sweep and starving the healthy ones behind them.
+test_unreadable_repos_do_not_starve_a_healthy_one() {
+  local home n repos
+  repos='"o/bad1","o/bad2","o/bad3","o/bad4","o/bad5","o/good"'
+  home=$(make_home starvation \
+    "{\"enabled\":true,\"trusted_logins\":[\"mengsig\"],\"repos\":[$repos]}")
+  # Only o/good serves a listing; the fake gh 404s on a repo with no canned file.
+  canned "$home" o/good comments \
+    "[$(comment 771 mengsig '@firstmate urgent' \
+      'https://github.com/o/good/issues/1#issuecomment-771')]"
+  for n in 1 2 3 4 5; do
+    printf '%s\n' "o/bad$n" >> "$home/gh/unreadable"
+  done
+
+  # Sweep 1 spends all five slots on the unreadable repositories.
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 0 "$(records_in "$home")" "the first sweep reaches only the unreadable repositories"
+  assert_equals '' "$(jq -r '.repos["o/good"] // ""' "$home/state/gh-mention-cursor.json")" \
+    "a repository that was never read has no read cursor"
+
+  # Sweep 2 must reach it, because the failures were stamped as attempted.
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_present "$home/state/gh-mention-inbox/comment-771.json" \
+    "a healthy repository must be read once the failures rotate to the back"
+  assert_equals 1 "$(wakes_in "$home")" "the mention in the healthy repository is queued"
+  pass "fm-gh-mention: repositories that cannot be read never starve a healthy one"
+}
 
 test_help_and_usage() {
   local out rc=0
@@ -271,16 +305,20 @@ test_every_watched_repo_makes_progress_at_a_constant_cost() {
   pass "fm-gh-mention: every watched repo makes progress at a constant three reads per poll"
 }
 
-test_the_least_recently_read_repo_goes_first() {
+# The read cursors below are deliberately the reverse of the attempt clock, so
+# this pins which of the two decides the order.
+test_the_least_recently_attempted_repo_goes_first() {
   local home first
   home=$(make_home order '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/fresh","o/stale"]}')
   jq -n '{schema:"fm-gh-mention-cursor.v1",
-          repos:{"o/fresh":"2026-09-20T11:00:00Z"},processed:[]}' \
+          repos:{"o/fresh":"2026-09-20T09:00:00Z","o/stale":"2026-09-20T11:00:00Z"},
+          processed:[],
+          attempted:{"o/fresh":"2026-09-20T11:00:00Z","o/stale":"2026-09-20T09:00:00Z"}}' \
     > "$home/state/gh-mention-cursor.json"
   run_plane "$home" poll >/dev/null 2>&1
   first=$(sed -n '1p' "$home/gh/paths.log")
-  assert_contains "$first" "repos/o/stale/" "the repo with no cursor is read before the freshly read one"
-  pass "fm-gh-mention: the least recently read repository is polled first"
+  assert_contains "$first" "repos/o/stale/" "the repo attempted longest ago is read first"
+  pass "fm-gh-mention: the least recently attempted repository is polled first"
 }
 
 test_a_registered_project_contributes_its_github_origin() {
@@ -360,12 +398,17 @@ test_arm_binds_the_shim_and_disarm_removes_it() {
 
 test_a_disabled_config_arms_nothing() {
   local home out rc=0
-  home=$(make_home disabled '{"enabled":false,"trusted_logins":["mengsig"],"repos":["o/one"]}')
+  home=$(make_home disabled '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/one"]}')
   canned "$home" o/one comments \
     "[$(comment 91 mengsig '@firstmate do this' 'https://github.com/o/one/issues/1#issuecomment-91')]"
+  run_plane "$home" arm >/dev/null 2>&1
+  assert_present "$home/state/gh-mention.check.sh" "an enabled plane arms its shim"
+  printf '%s\n' '{"enabled":false,"trusted_logins":["mengsig"],"repos":["o/one"]}' \
+    > "$home/config/gh-mentions.json"
   out=$(run_plane "$home" arm 2>&1) || rc=$?
-  expect_code 1 "$rc" "arm must refuse a disabled plane"
-  assert_contains "$out" "enabled=false" "the refusal names the disabled setting"
+  expect_code 1 "$rc" "arm must refuse a disabled plane so its caller retires the shim"
+  assert_equals '' "$out" \
+    "pausing the plane is a steady state, so it reports nothing every session"
   out=$(run_plane "$home" poll 2>&1)
   [ -z "$out" ] || fail "a disabled poll must stay silent: $out"
   assert_absent "$home/gh/paths.log" "a disabled poll makes no forge read"
@@ -754,7 +797,7 @@ test_a_repeated_poll_does_not_duplicate_the_record
 test_ack_moves_the_record_into_handled
 test_an_unwatched_repo_is_never_read
 test_every_watched_repo_makes_progress_at_a_constant_cost
-test_the_least_recently_read_repo_goes_first
+test_the_least_recently_attempted_repo_goes_first
 test_a_registered_project_contributes_its_github_origin
 test_an_unresolvable_project_is_reported_not_dropped
 test_an_empty_watched_set_says_there_is_nothing_to_watch
@@ -778,3 +821,4 @@ test_an_unfiled_mention_keeps_the_repo_cursor
 test_subject_type_comes_from_the_kind_segment
 test_a_sweep_reads_at_most_the_capped_number_of_repositories
 test_a_refused_allowance_is_named_as_itself
+test_unreadable_repos_do_not_starve_a_healthy_one

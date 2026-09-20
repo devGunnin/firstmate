@@ -1194,9 +1194,10 @@ x_mode_setup() {
     if x_mode_remove_artifacts; then
       x_mode_report_cadence_set "$cadence_other" "$cadence_other_plane"
       echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence"
-    else
-      echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence; stale artifacts remain"
+      return 0
     fi
+    [ -z "$cadence_other" ] || x_mode_report_cadence_unsettled
+    echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence; stale artifacts remain"
   }
 
   watch_cadence_request 30 'the relay poll'
@@ -1217,6 +1218,7 @@ x_mode_setup() {
   x_mode_write_if_changed "$cadence" "$(watch_cadence_body "$WATCH_CADENCE_WANT")" 600 \
     || { fmx_arm_failed; return 0; }
 
+  x_mode_report_cadence_set "$WATCH_CADENCE_WANT" "$WATCH_CADENCE_OWNER"
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; ${WATCH_CADENCE_WANT}s watcher cadence in config/x-mode.env"
 }
 

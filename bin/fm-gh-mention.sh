@@ -40,19 +40,25 @@
 #   repos/<o>/<r>/issues/comments  issue and PR conversation comments
 #   repos/<o>/<r>/pulls/comments   PR review comments
 #   repos/<o>/<r>/issues           newly opened or edited issue and PR bodies
-# Repos are read oldest-cursor first and at most FM_GH_MENTION_MAX_REPOS of them
-# per sweep, so a watched set too large for one sweep rotates across sweeps
-# instead of starving its tail. A repo whose reads do not all complete keeps its
-# cursor, so nothing is skipped. The cap is what keeps the hourly cost fixed:
+# Repos are read least-recently-ATTEMPTED first and at most
+# FM_GH_MENTION_MAX_REPOS of them per sweep, so a watched set too large for one
+# sweep rotates across sweeps instead of starving its tail. Every attempt is
+# stamped, including one that failed, so a repo nobody can read yields its slot
+# on the next sweep rather than holding one forever; that clock is separate
+# from the read cursor, which a repo whose reads do not all complete keeps, so
+# nothing is skipped. The cap is what keeps the hourly cost fixed:
 # 3 x cap x (3600 / interval) calls, and a larger watched set buys a longer
-# worst-case pickup - ceil(watched / cap) x interval - rather than an exhausted
-# allowance shared with every other gh-backed plane on this host.
+# worst-case pickup - ceil(watched / cap) x interval, which holds whether the
+# other repos read cleanly or not - rather than an exhausted allowance shared
+# with every other gh-backed plane on this host.
 #
 # DURABLE STATE (all under state/, all gitignored):
 #   gh-mention-inbox/<record-id>.json          one accepted mention, pending
 #   gh-mention-inbox/handled/<record-id>.json  the same record after ack
-#   gh-mention-cursor.json                     per-repo since cursors and the
-#                                              bounded processed-id list
+#   gh-mention-cursor.json                     per-repo since cursors, the
+#                                              per-repo attempt clock that
+#                                              orders sweeps, and the bounded
+#                                              processed-id list
 #   gh-mention.reported                        the failure diagnostics the last
 #                                              poll printed, so a condition that
 #                                              outlives one poll is reported once
@@ -309,12 +315,13 @@ cursor_read() {
   if [ -f "$CURSOR" ] && [ ! -L "$CURSOR" ] \
     && jq -e --arg s "$CURSOR_SCHEMA" '.schema == $s and (.repos|type=="object")
         and (.processed|type=="array")
-        and ((.grants // {}) | type == "object") and ((.lapsed // []) | type == "array")' \
+        and ((.grants // {}) | type == "object") and ((.lapsed // []) | type == "array")
+        and ((.attempted // {}) | type == "object")' \
       "$CURSOR" >/dev/null 2>&1; then
     cat "$CURSOR"
     return 0
   fi
-  jq -n --arg s "$CURSOR_SCHEMA" '{schema:$s,repos:{},processed:[],grants:{},lapsed:[]}'
+  jq -n --arg s "$CURSOR_SCHEMA" '{schema:$s,repos:{},processed:[],grants:{},lapsed:[],attempted:{}}'
 }
 
 cursor_write() {  # <cursor-json-file>
@@ -606,9 +613,13 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
   local repo=$1 state_json=$2 start=$3 out=$4 since line id advance charge unfiled=0
   since=$(jq -r --arg r "$repo" --arg b "$BACKFILL_SINCE" '.repos[$r] // $b' "$state_json")
   cp "$state_json" "$out" || return 1
+  # Stamped before the first read can fail, so a repo that never reads cleanly
+  # still rotates to the back of the order instead of holding a slot forever.
+  jq --arg r "$repo" --arg t "$start" '.attempted[$r] = $t' "$out" > "$TMP/attempt.json" \
+    && mv -f -- "$TMP/attempt.json" "$out"
   if ! read_repo "$repo" "$since" "$TMP/candidates.jsonl" "$TMP/bound"; then
     if [ "$RATE_LIMITED" -eq 1 ]; then
-      diag "GitHub refused this host's API allowance, so no watched repository was read this cycle; every gh-backed plane on this host is affected until the allowance resets"
+      diag "GitHub refused this host's API allowance, so this cycle stopped at the refused call; every gh-backed plane on this host is affected until the allowance resets"
     elif [ "$BUDGET_EXHAUSTED" -eq 0 ]; then
       diag "could not read $repo this cycle; it is retried next cycle"
     fi
@@ -715,19 +726,22 @@ poll_cycle() {
     swept=$((swept + 1))
     mv -f -- "$next" "$state_json"
     [ "$BUDGET_EXHAUSTED" -eq 0 ] && [ "$RATE_LIMITED" -eq 0 ] || break
-  done < <(order_by_cursor "$state_json" "$repos")
+  done < <(order_by_attempt "$state_json" "$repos")
   cursor_write "$state_json" || diag 'could not record how far the watched repositories were read'
   return 0
 }
 
-# Oldest cursor first, so one budget's worth of reads rotates through a watched
-# set too large to finish in a single poll instead of always starving its tail.
-order_by_cursor() {  # <cursor-json> <repo-list>
-  local state_json=$1 repos=$2
-  printf '%s\n' "$repos" | while IFS= read -r repo; do
-    [ -n "$repo" ] || continue
-    printf '%s\t%s\n' "$(jq -r --arg r "$repo" '.repos[$r] // ""' "$state_json")" "$repo"
-  done | sort | cut -f2-
+# Least-recently-attempted first, so one sweep's slots rotate through a watched
+# set larger than the cap instead of starving its tail. This is the attempt
+# clock, NOT the read cursor: a read that failed still counts as an attempt, so
+# a repo that can never be read yields its slot on the next sweep, while its
+# read cursor stays where it was and re-reads the window it never got through.
+order_by_attempt() {  # <cursor-json> <repo-list>
+  local state_json=$1 repos=$2 repos_json
+  repos_json=$(printf '%s\n' "$repos" | jq -Rsc 'split("\n") | map(select(length > 0))') || return 1
+  jq -r --argjson repos "$repos_json" '
+    (.attempted // {}) as $a
+    | $repos | map({r: ., t: ($a[.] // "")}) | sort_by(.t, .r)[] | .r' "$state_json"
 }
 
 iso_shift() {  # <iso-utc> <seconds-back>
@@ -810,10 +824,9 @@ action_arm() {
     1) printf 'fm-gh-mention: no config/gh-mentions.json; nothing to arm\n' >&2; return 1 ;;
     2) printf 'fm-gh-mention: %s\n' "$CONFIG_PROBLEM" >&2; return 1 ;;
   esac
-  if [ "$CFG_ENABLED" != true ]; then
-    printf 'fm-gh-mention: config/gh-mentions.json has enabled=false; nothing to arm\n' >&2
-    return 1
-  fi
+  # A deliberate enabled=false is a steady state, not a problem to report every
+  # session; the caller still retires the shim on this non-zero exit.
+  [ "$CFG_ENABLED" = true ] || return 1
   fm_check_shim_arm "$STATE" "$CHECK_ID" "$SCRIPT_DIR/fm-gh-mention.sh" \
     'GitHub mention poll shim' "$FM_HOME" || return 1
   unwatched_projects | while IFS= read -r line; do say "$line"; done
