@@ -825,6 +825,33 @@ SH
   pass "bootstrap reports missing X-mode dependencies before arming"
 }
 
+# config/x-mode.env is the home's ONE watcher cadence, written for whichever
+# plane asked for the fastest interval. Relay failing to arm must not drop
+# another plane's recorded request, or that plane polls while the watcher keeps
+# sweeping on the 300s default.
+test_bootstrap_keeps_another_planes_cadence_when_x_deps_are_missing() {
+  local home out
+  home="$TMP_ROOT/boot-cadence-other"; mkdir -p "$home/config"
+  printf 'FMX_PAIRING_TOKEN=tok-cadence\n' > "$home/.env"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  out=$(PATH="$(fm_test_base_path_sans "$BASE_PATH" curl)" FM_HOME="$home" \
+    "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+  assert_contains "$out" "MISSING: curl" "the missing X-mode dependency is still reported"
+  assert_not_contains "$out" "FMX: X mode on" \
+    "bootstrap must not announce X mode when a dependency is missing"
+  assert_not_contains "$out" "FMX: X mode off" \
+    "bootstrap must stay quiet about artifacts a home never had"
+  assert_absent "$home/state/x-watch.check.sh" "missing curl must not arm the relay shim"
+  assert_present "$home/state/gh-mention.check.sh" \
+    "the mention plane still arms on its own dependencies"
+  assert_present "$home/config/x-mode.env" \
+    "a cadence another plane asked for must survive X mode's missing dependencies"
+  assert_grep "export FM_CHECK_INTERVAL=30" "$home/config/x-mode.env" \
+    "the settled cadence is the one the mention plane asked for"
+  pass "bootstrap keeps another plane's watcher cadence when X-mode dependencies are missing"
+}
+
 test_bootstrap_does_not_announce_when_arm_fails() {
   local home out
   home="$TMP_ROOT/boot-arm-fail"; mkdir -p "$home"
@@ -3104,6 +3131,7 @@ test_followup_usage_errors
 test_bootstrap_activates_on_env_token
 test_bootstrap_relative_home_writes_absolute_poll_shim
 test_bootstrap_reports_missing_x_dependency
+test_bootstrap_keeps_another_planes_cadence_when_x_deps_are_missing
 test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_does_not_follow_x_artifact_symlinks
 test_bootstrap_inert_without_token

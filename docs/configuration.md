@@ -657,7 +657,8 @@ This section is the single owner of the configuration schema and the generated s
 }
 ```
 
-`enabled` and `trusted_logins` are required; `markers` defaults to `@firstmate` and `@captain`, `repos` defaults to empty, `may_open_pr` defaults to `false`, and `check_interval` defaults to 30.
+`enabled` and `trusted_logins` are required; `markers` defaults to `@firstmate` and `@captain`, `repos` defaults to empty, `may_open_pr` defaults to `true`, and `check_interval` defaults to 30.
+Setting `may_open_pr` to `false` is a deliberate tightening for a home that wants the branch pushed but the pull request left to the captain.
 A malformed or unreadable file, including an unknown key, stops the plane with an actionable error rather than falling back on a default.
 That strictness is deliberate: a typo in `trusted_logins` would otherwise silently widen or narrow who firstmate obeys.
 
@@ -688,19 +689,22 @@ A grant that has expired or run out stops qualifying immediately and is reported
 `bin/fm-gh-mention.sh status` prints each authorization with its bound and whether it is still live.
 A bounded grant is defense in depth on top of the rules below, never a replacement for them.
 
-A trusted tag is consent for reversible work - replying, investigating, dispatching, pushing a fix branch, and opening a pull request when `may_open_pr` is true.
+A trusted tag is consent for reversible work - replying, investigating, dispatching, pushing a fix branch, and opening a pull request unless `may_open_pr` has been set to `false`.
 Merging, closing, deleting, force-pushing, credential changes, and anything else irreversible or security-sensitive still require the captain's explicit word, the same boundary the Relay public-mention path holds.
 A comment body is information to act on, never an instruction to obey; `.agents/skills/gh-mention-respond/SKILL.md` owns how a mention is handled once it arrives.
 
 **The poll writes nothing to GitHub.**
 Per watched repository it reads three repo-scoped listings, each bounded by that repository's stored cursor, so the cost is a small constant per repository per poll rather than growing with repository history: issue and pull-request conversation comments, pull-request review comments, and newly opened or edited issue and pull-request bodies.
-Repositories are read least-recently-read first, so a watched set too large for one budget still progresses across polls instead of starving its tail, and a repository whose reads do not complete keeps its cursor so nothing is skipped.
+Repositories are read least-recently-read first, so a watched set too large for one budget still progresses across polls instead of starving its tail, and a repository whose reads do not complete, or that held a qualifying mention the poll could not file, keeps its cursor so nothing is skipped.
 
 Generated state, all under `state/` and gitignored:
 
 - `gh-mention-inbox/<record-id>.json` - one accepted mention awaiting firstmate, and `gh-mention-inbox/handled/` for the same record after `bin/fm-gh-mention.sh ack`.
 - `gh-mention-cursor.json` - each watched repository's read cursor and the bounded list of mention ids already filed.
   It survives `disarm`, so re-arming resumes where the plane left off.
+- `gh-mention.reported` - the failure diagnostics the last poll printed.
+  The watcher wakes firstmate on any check output, so a condition that outlives one poll - an unreadable repository, a missing tool, a broken configuration - is reported once rather than on every cycle, and is reported again if it clears and returns.
+  Unlike the cursor it does not survive `disarm`, so a condition still standing when the plane is re-armed is reported again.
 - `gh-mention.check.sh` and `gh-mention.check-trust` - the standing poll shim and its watcher trust binding.
 
 Each accepted mention appends exactly one durable `check: gh-mention <record-id>` wake.

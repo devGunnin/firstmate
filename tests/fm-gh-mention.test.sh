@@ -111,6 +111,8 @@ test_malformed_config_stops_the_plane_loudly() {
   home=$(make_home malformed 'this is not json')
   out=$(run_plane "$home" poll 2>&1)
   assert_contains "$out" "is not valid JSON" "a malformed config is reported by the poll"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals '' "$out" "a config that stays malformed is not re-reported every cycle"
   assert_absent "$home/gh/paths.log" "a malformed config makes no forge read"
   assert_absent "$home/state/gh-mention-inbox" "a malformed config files no record"
   out=$(run_plane "$home" status 2>&1) || rc=$?
@@ -337,10 +339,16 @@ test_arm_binds_the_shim_and_disarm_removes_it() {
   out=$(run_plane "$home" arm 2>&1)
   assert_contains "$out" "armed" "re-arming stays armed"
   assert_contains "$(run_plane "$home" status 2>&1)" "armed: yes" "status reports the armed plane"
+  : > "$home/gh/fail"
+  run_plane "$home" poll >/dev/null 2>&1
+  rm -f "$home/gh/fail"
+  assert_present "$home/state/gh-mention.reported" "a reported failure is recorded"
   out=$(run_plane "$home" disarm 2>&1)
   assert_contains "$out" "disarmed" "disarm names what it retired"
   assert_absent "$home/state/gh-mention.check.sh" "disarm removes the shim"
   assert_absent "$home/state/gh-mention.check-trust" "disarm removes the trust binding"
+  assert_absent "$home/state/gh-mention.reported" \
+    "disarm forgets what was reported so a standing condition is reported again after a re-arm"
   assert_present "$home/state/gh-mention-cursor.json" \
     "disarm keeps the read cursor so a re-arm resumes where the plane left off"
   pass "fm-gh-mention: arm writes and binds the shim, and disarm removes every trace"
@@ -582,6 +590,70 @@ test_a_failed_read_keeps_the_repo_cursor() {
   pass "fm-gh-mention: a repository whose read fails keeps its cursor and is reported"
 }
 
+# The watcher wakes firstmate on ANY output from this check, so a condition that
+# outlives one poll must be reported once rather than on every cycle.
+test_a_persistent_failure_is_reported_once() {
+  local home out
+  home=$(make_home repeat "$DEFAULT_CONFIG")
+  canned "$home" owner/demo comments \
+    "[$(comment 222 mengsig '@firstmate urgent' \
+      'https://github.com/owner/demo/issues/2#issuecomment-222')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  : > "$home/gh/fail"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" "could not read owner/demo" "the first poll of a new failure reports it"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals '' "$out" \
+    "a failure that persists must stay silent instead of waking the supervisor every cycle"
+  rm -f "$home/gh/fail"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals '' "$out" "a recovered repo with nothing new says nothing"
+  : > "$home/gh/fail"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" "could not read owner/demo" \
+    "a failure that returns after clearing is reported again"
+  pass "fm-gh-mention: a persistent failure is reported once, and again only if it returns"
+}
+
+# A mention that qualified but could not be filed must be genuinely re-derived,
+# which only happens if its repo's cursor does not step over the window it was in.
+test_an_unfiled_mention_keeps_the_repo_cursor() {
+  local home out
+  home=$(make_home unfiled "$DEFAULT_CONFIG")
+  canned "$home" owner/demo comments \
+    "[$(comment 333 mengsig '@firstmate please look' \
+      'https://github.com/owner/demo/issues/3#issuecomment-333')]"
+  mkdir -p "$home/state/gh-mention-inbox"
+  ln -s "$home/state/elsewhere.json" "$home/state/gh-mention-inbox/comment-333.json"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" "could not file a mention" "a mention that cannot be filed is reported"
+  assert_absent "$home/state/elsewhere.json" "a linked record destination is never written through"
+  assert_equals 0 "$(wakes_in "$home")" "an unfiled mention queues no wake"
+  assert_equals null \
+    "$(jq -r '.repos["owner/demo"] // "null"' "$home/state/gh-mention-cursor.json")" \
+    "a repo holding an unfiled mention must not advance past the window it was in"
+  rm -f "$home/state/gh-mention-inbox/comment-333.json"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_present "$home/state/gh-mention-inbox/comment-333.json" \
+    "the unfiled mention is re-derived and filed once it can be written"
+  assert_equals 1 "$(wakes_in "$home")" "the re-derived mention queues its wake"
+  pass "fm-gh-mention: a mention that could not be filed is re-derived rather than lost"
+}
+
+test_opening_a_pull_request_is_consented_unless_withheld() {
+  local home out
+  home=$(make_home consent-default '{"enabled":true,"trusted_logins":["mengsig"]}')
+  out=$(run_plane "$home" status 2>&1)
+  assert_contains "$out" "may open pr: true" \
+    "the minimal configuration carries the trusted tag's consent to open a pull request"
+  home=$(make_home consent-withheld \
+    '{"enabled":true,"trusted_logins":["mengsig"],"may_open_pr":false}')
+  out=$(run_plane "$home" status 2>&1)
+  assert_contains "$out" "may open pr: false" \
+    "a home that deliberately withholds pull-request opening still can"
+  pass "fm-gh-mention: opening a pull request is consented unless deliberately withheld"
+}
+
 test_help_and_usage
 test_absent_config_is_completely_inert
 test_malformed_config_stops_the_plane_loudly
@@ -612,3 +684,6 @@ test_a_malformed_grant_is_refused
 test_the_plane_requests_a_fast_watcher_cadence
 test_a_full_page_stops_the_cursor_where_the_read_stopped
 test_a_failed_read_keeps_the_repo_cursor
+test_a_persistent_failure_is_reported_once
+test_an_unfiled_mention_keeps_the_repo_cursor
+test_opening_a_pull_request_is_consented_unless_withheld

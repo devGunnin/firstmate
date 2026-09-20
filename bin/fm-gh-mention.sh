@@ -49,6 +49,9 @@
 #   gh-mention-inbox/handled/<record-id>.json  the same record after ack
 #   gh-mention-cursor.json                     per-repo since cursors and the
 #                                              bounded processed-id list
+#   gh-mention.reported                        the failure diagnostics the last
+#                                              poll printed, so a condition that
+#                                              outlives one poll is reported once
 # A record id is the mention's own GitHub identity - issue-<id> for an issue or
 # PR body, comment-<id> for a conversation comment, review-comment-<id> for a PR
 # review comment - so a repeated poll re-derives the same id and never files the
@@ -94,6 +97,7 @@ CONFIG="$CONFIG_DIR/gh-mentions.json"
 CHECK_ID=gh-mention
 INBOX="$STATE/gh-mention-inbox"
 CURSOR="$STATE/gh-mention-cursor.json"
+REPORT_RECORD="$STATE/gh-mention.reported"
 LOCK="$STATE/.gh-mention.lock"
 CURSOR_SCHEMA=fm-gh-mention-cursor.v1
 RECORD_SCHEMA=fm-gh-mention.v1
@@ -112,6 +116,52 @@ PER_PAGE=100
 usage() { sed -n '2,/^set -u$/s/^# \{0,1\}//p' "$0"; }
 say() { printf 'gh-mention: %s\n' "$1"; }
 die() { printf 'fm-gh-mention: %s\n' "$1" >&2; exit 2; }
+
+# ------------------------------------------------------- reported-once failures
+#
+# The watcher wakes firstmate on ANY non-empty check output, so a failure that
+# outlives one poll - an unreadable repo, a missing tool, a broken config -
+# must be reported once rather than on every cycle, or it tears the watcher
+# down at this plane's own 30s cadence forever. bin/fm-x-poll.sh and
+# bin/fm-mail-check.sh keep the same contract against the same watcher.
+# Diagnostics therefore go to diag() and are flushed once at the end of a poll;
+# news (an accepted mention, a grant that just lapsed) is a one-off event that
+# always prints through say().
+DIAGNOSTICS=
+
+diag() {  # <message>
+  DIAGNOSTICS="${DIAGNOSTICS}gh-mention: $1"$'\n'
+}
+
+report_record_write() {  # <reported-text>; empty forgets what was reported
+  local staged
+  [ -d "$STATE" ] && [ ! -L "$STATE" ] || return 1
+  if [ -z "$1" ]; then
+    rm -f -- "$REPORT_RECORD"
+    return 0
+  fi
+  staged=$(umask 077; mktemp "$STATE/.gh-mention-reported.XXXXXX") || return 1
+  if ! printf '%s\n' "$1" > "$staged" || ! chmod 0600 "$staged" \
+    || ! mv -f -- "$staged" "$REPORT_RECORD"; then
+    rm -f -- "$staged"
+    return 1
+  fi
+}
+
+# Print this poll's diagnostics unless the last poll already reported exactly
+# them, then record what was reported. A condition that clears is forgotten, so
+# it is reported again if it returns. Reporting before recording makes a record
+# that cannot be written cost a repeated report rather than a lost one.
+diag_flush() {
+  local pending=${DIAGNOSTICS%$'\n'} previous=
+  DIAGNOSTICS=
+  if [ -f "$REPORT_RECORD" ] && [ ! -L "$REPORT_RECORD" ]; then
+    previous=$(cat "$REPORT_RECORD" 2>/dev/null) || previous=
+  fi
+  [ "$pending" != "$previous" ] || return 0
+  [ -z "$pending" ] || printf '%s\n' "$pending"
+  report_record_write "$pending" || true
+}
 
 TMP=
 LOCK_HELD=0
@@ -186,7 +236,7 @@ config_require() {
   case "$rc" in
     0) return 0 ;;
     1) return 1 ;;
-    *) say "$CONFIG_PROBLEM"; return 2 ;;
+    *) diag "$CONFIG_PROBLEM"; return 2 ;;
   esac
 }
 
@@ -519,18 +569,19 @@ resolve_budget() {
 }
 
 # One repo's turn: read, qualify, file what is new. The cursor advances only
-# after every read for that repo succeeded, so a bounded or failed read costs a
-# repeat rather than a missed mention.
+# after every read for that repo succeeded AND every qualifying mention in the
+# window was filed, so a bounded read, a failed read, or a mention that could
+# not be filed costs a repeat rather than a missed mention.
 poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
-  local repo=$1 state_json=$2 start=$3 out=$4 since line id advance charge
+  local repo=$1 state_json=$2 start=$3 out=$4 since line id advance charge unfiled=0
   since=$(jq -r --arg r "$repo" --arg b "$BACKFILL_SINCE" '.repos[$r] // $b' "$state_json")
   cp "$state_json" "$out" || return 1
   if ! read_repo "$repo" "$since" "$TMP/candidates.jsonl" "$TMP/bound"; then
-    [ "$BUDGET_EXHAUSTED" -eq 1 ] || say "could not read $repo this cycle; it is retried next cycle"
+    [ "$BUDGET_EXHAUSTED" -eq 1 ] || diag "could not read $repo this cycle; it is retried next cycle"
     return 1
   fi
   if ! qualify "$TMP/candidates.jsonl" "$repo" "$TMP/qualified.jsonl"; then
-    say "could not read $repo's new activity; it is retried next cycle"
+    diag "could not read $repo's new activity; it is retried next cycle"
     return 1
   fi
   jq -c --slurpfile c "$state_json" '
@@ -548,7 +599,8 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
     case "$charge" in
       0) ;;
       2) continue ;;
-      *) say "could not durably record a bounded authorization being spent; this mention is not accepted"
+      *) diag "could not durably record a bounded authorization being spent; this mention is not accepted"
+         unfiled=1
          continue ;;
     esac
     if accept "$TMP/one.json" "$id" "$start"; then
@@ -557,9 +609,13 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
         '.processed = ((.processed - [$id]) + [$id] | .[-$keep:])' "$out" > "$TMP/next.json" \
         && mv -f -- "$TMP/next.json" "$out"
     else
-      say "could not file a mention from $repo; it stays unfiled until the next cycle"
+      diag "could not file a mention from $repo; it stays unfiled until the next cycle"
+      unfiled=1
     fi
   done < "$TMP/new.jsonl"
+  # A mention this window qualified but could not file is only genuinely
+  # retried if the window is read again, so the cursor stays where it was.
+  [ "$unfiled" -eq 0 ] || return 1
   # A full page means this poll did not reach the present, so the cursor stops
   # at the last moment actually read; the next poll continues from there instead
   # of stepping over what the page cut off.
@@ -569,12 +625,20 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
     && mv -f -- "$TMP/next.json" "$out"
 }
 
+# Every failure this cycle is collected rather than printed, so the one flush
+# below decides what the watcher actually sees.
 action_poll() {
+  poll_cycle
+  diag_flush
+  return 0
+}
+
+poll_cycle() {
   local start repos repo state_json next
   config_require || return 0
   [ "$CFG_ENABLED" = true ] || return 0
-  command -v gh >/dev/null 2>&1 || { say 'gh is required to read watched repositories'; return 0; }
-  command -v jq >/dev/null 2>&1 || { say 'jq is required to read watched repositories'; return 0; }
+  command -v gh >/dev/null 2>&1 || { diag 'gh is required to read watched repositories'; return 0; }
+  command -v jq >/dev/null 2>&1 || { diag 'jq is required to read watched repositories'; return 0; }
   resolve_budget
   acquire
   TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-gh-mention.XXXXXX") || die 'no scratch directory'
@@ -584,7 +648,7 @@ action_poll() {
   BACKFILL_SINCE=$(iso_shift "$start" "${FM_GH_MENTION_BACKFILL:-3600}") || BACKFILL_SINCE=
   OVERLAP_SINCE=$(iso_shift "$start" 60) || OVERLAP_SINCE=
   if [ -z "$BACKFILL_SINCE" ] || [ -z "$OVERLAP_SINCE" ]; then
-    say "cannot read the clock as a UTC timestamp ($start)"
+    diag "cannot read the clock as a UTC timestamp ($start)"
     return 0
   fi
   KEEP=${FM_GH_MENTION_KEEP:-500}
@@ -599,7 +663,7 @@ action_poll() {
   LIVE_LOGINS_JSON=$(grants_live "$state_json" "$start" \
     | jq -Rsc 'split("\n") | map(select(length > 0))') || LIVE_LOGINS_JSON=
   if [ -z "$LIVE_LOGINS_JSON" ]; then
-    say 'could not read which authorizations are still live; no mention is accepted this cycle'
+    diag 'could not read which authorizations are still live; no mention is accepted this cycle'
     return 0
   fi
   # A renewed grant becomes reportable again the next time it lapses.
@@ -613,7 +677,7 @@ action_poll() {
     mv -f -- "$next" "$state_json"
     [ "$BUDGET_EXHAUSTED" -eq 0 ] || break
   done < <(order_by_cursor "$state_json" "$repos")
-  cursor_write "$state_json" || say 'could not record how far the watched repositories were read'
+  cursor_write "$state_json" || diag 'could not record how far the watched repositories were read'
   return 0
 }
 
@@ -721,9 +785,10 @@ action_arm() {
 
 # The read cursor survives a disarm on purpose: re-arming then resumes where
 # the plane left off instead of re-reading a backfill window and re-filing
-# mentions the home has already seen.
+# mentions the home has already seen. What was already reported does not
+# survive, so a condition still standing at the re-arm is reported again.
 action_disarm() {
-  fm_check_shim_disarm "$STATE" "$CHECK_ID"
+  fm_check_shim_disarm "$STATE" "$CHECK_ID" "$REPORT_RECORD"
 }
 
 trap cleanup EXIT

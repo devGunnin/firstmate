@@ -977,9 +977,21 @@ supervision.
 
 EOF
 elif [ -f "$CONFIG/x-mode.env" ]; then
+  # config/x-mode.env is the home's one watcher cadence, written for whichever
+  # plane asked for the fastest interval, so name the plane that is actually
+  # armed rather than asserting Relay is on.
+  if [ -e "$STATE/x-watch.check.sh" ] && [ -e "$STATE/gh-mention.check.sh" ]; then
+    CADENCE_SUBJECT='X mode and the GitHub mention plane are active'
+  elif [ -e "$STATE/x-watch.check.sh" ]; then
+    CADENCE_SUBJECT='X mode is active'
+  elif [ -e "$STATE/gh-mention.check.sh" ]; then
+    CADENCE_SUBJECT='The GitHub mention plane is active'
+  else
+    CADENCE_SUBJECT='A fast watcher cadence is configured'
+  fi
   cat <<EOF
 Follow the supervision operating instructions block above for harness '$PRIMARY_HARNESS'.
-X mode is active, so the emitted block's cadence instruction applies.
+$CADENCE_SUBJECT, so the emitted block's cadence instruction applies.
 This script never starts supervision itself.
 
 EOF

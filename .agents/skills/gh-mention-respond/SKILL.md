@@ -74,7 +74,7 @@ A trusted tag is standing consent for **reversible** work, and nothing more:
 - Replying on the thread, reading the repository, and investigating.
 - Filing backlog work and dispatching a crewmate through the normal lifecycle.
 - Pushing a fix branch.
-- Opening a pull request, **only when `may_open_pr` is true** in the live configuration; when it is false, do the work and hand the captain the branch instead.
+- Opening a pull request, which a trusted tag already consents to; only a live configuration that has deliberately set `may_open_pr` to false withholds it, and then you do the work and hand the captain the branch instead.
 
 It is never consent for merging, closing, deleting, force-pushing, changing credentials or permissions, or anything else irreversible or security-sensitive.
 Those go to the captain through the trusted channel for an explicit word, and the public reply says only that it has been raised with the captain.

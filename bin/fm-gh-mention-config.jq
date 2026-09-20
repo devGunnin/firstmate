@@ -74,7 +74,10 @@ def problem:
 
 if problem then "invalid: " + problem
 else
-  [(.enabled | tostring), ((.may_open_pr // false) | tostring),
+  # An absent may_open_pr carries the trusted tag's consent to open a pull
+  # request; `//` cannot express that, because it would read a deliberate
+  # false as absent.
+  [(.enabled | tostring), (if .may_open_pr == null then true else .may_open_pr end | tostring),
    ((.check_interval // 30) | tostring), "--trusted"]
   + (.trusted_logins | map(normalize_grant | tojson))
   + ["--markers"] + ((.markers // ["@firstmate", "@captain"]) | map(.))

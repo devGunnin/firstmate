@@ -1119,12 +1119,19 @@ x_mode_setup() {
     fi
   done
   if [ "$missing" -ne 0 ]; then
-    if x_mode_artifact_present "$shim" || x_mode_artifact_present "$cadence"; then
-      if x_mode_remove_artifacts; then
+    # Relay cannot arm, but another plane's cadence request still has to be
+    # settled: the cadence is the home's, not Relay's. Report only what was
+    # actually there, so a home that never armed Relay hears nothing.
+    had_shim=0
+    x_mode_artifact_present "$shim" && had_shim=1
+    had_cadence=0
+    x_mode_artifact_present "$cadence" && had_cadence=1
+    if x_mode_remove_artifacts; then
+      if [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ]; then
         echo "FMX: X mode off - missing relay poll dependencies; install them and rerun bootstrap"
-      else
-        echo "FMX: X mode off - failed to remove relay poll shim or 30s cadence after missing relay poll dependencies"
       fi
+    elif [ "$had_shim" -eq 1 ] || [ "$had_cadence" -eq 1 ] || [ -n "$cadence_other" ]; then
+      echo "FMX: X mode off - failed to remove relay poll shim or 30s cadence after missing relay poll dependencies"
     fi
     return 0
   fi
