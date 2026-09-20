@@ -1192,6 +1192,7 @@ x_mode_setup() {
 
   fmx_arm_failed() {
     if x_mode_remove_artifacts; then
+      x_mode_report_cadence_set "$cadence_other" "$cadence_other_plane"
       echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence"
     else
       echo "FMX: X mode off - failed to arm relay poll shim or 30s cadence; stale artifacts remain"

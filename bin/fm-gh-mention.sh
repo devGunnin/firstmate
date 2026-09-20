@@ -40,9 +40,13 @@
 #   repos/<o>/<r>/issues/comments  issue and PR conversation comments
 #   repos/<o>/<r>/pulls/comments   PR review comments
 #   repos/<o>/<r>/issues           newly opened or edited issue and PR bodies
-# Repos are read oldest-cursor first, so a watched set too large for one budget
-# still progresses across polls instead of starving its tail. A repo whose reads
-# do not all complete keeps its cursor, so nothing is skipped.
+# Repos are read oldest-cursor first and at most FM_GH_MENTION_MAX_REPOS of them
+# per sweep, so a watched set too large for one sweep rotates across sweeps
+# instead of starving its tail. A repo whose reads do not all complete keeps its
+# cursor, so nothing is skipped. The cap is what keeps the hourly cost fixed:
+# 3 x cap x (3600 / interval) calls, and a larger watched set buys a longer
+# worst-case pickup - ceil(watched / cap) x interval - rather than an exhausted
+# allowance shared with every other gh-backed plane on this host.
 #
 # DURABLE STATE (all under state/, all gitignored):
 #   gh-mention-inbox/<record-id>.json          one accepted mention, pending
@@ -82,8 +86,8 @@
 # cadence config/x-mode.env that bin/fm-bootstrap.sh already owns for Relay: a
 # home running both planes gets one interval, the fastest either asked for,
 # never two. A tight cadence is affordable because the per-poll cost is fixed at
-# three reads per repo; it is still 3 x repos reads every interval, so a large
-# watched set is what a longer `check_interval` is for.
+# three reads per capped repo; a large watched set costs pickup time rather
+# than allowance, so a longer `check_interval` buys the host headroom.
 #
 # Environment:
 #   FM_GH_MENTION_BUDGET    seconds one poll may spend on forge reads
@@ -91,6 +95,8 @@
 #                           FM_CHECK_TIMEOUT); each call is additionally bounded
 #   FM_GH_MENTION_BACKFILL  seconds of history read for a repo that has no
 #                           cursor yet (default 3600)
+#   FM_GH_MENTION_MAX_REPOS watched repos one sweep may read (default 5); the
+#                           rest are read on the following sweeps, oldest first
 #   FM_GH_MENTION_KEEP      processed ids retained in the cursor (default 500)
 #   FM_GH_MENTION_NOW       ISO UTC clock override for tests
 set -u
@@ -203,7 +209,6 @@ config_load() {
   CFG_REPOS=
   CFG_TRUSTED_JSON='[]'
   CFG_MARKERS_JSON='[]'
-  CFG_MAY_OPEN_PR=false
   CFG_INTERVAL=
   [ -e "$CONFIG" ] || return 1
   if [ -L "$CONFIG" ] || [ ! -f "$CONFIG" ] || [ ! -r "$CONFIG" ]; then
@@ -226,8 +231,7 @@ config_load() {
     'invalid: '*) CONFIG_PROBLEM="config/gh-mentions.json ${parsed#invalid: }"; return 2 ;;
   esac
   CFG_ENABLED=$(printf '%s\n' "$parsed" | sed -n '1p')
-  CFG_MAY_OPEN_PR=$(printf '%s\n' "$parsed" | sed -n '2p')
-  CFG_INTERVAL=$(printf '%s\n' "$parsed" | sed -n '3p')
+  CFG_INTERVAL=$(printf '%s\n' "$parsed" | sed -n '2p')
   CFG_TRUSTED=$(printf '%s\n' "$parsed" | sed -n '/^--trusted$/,/^--markers$/p' | sed '1d;$d')
   CFG_MARKERS=$(printf '%s\n' "$parsed" | sed -n '/^--markers$/,/^--repos$/p' | sed '1d;$d')
   CFG_REPOS=$(printf '%s\n' "$parsed" | sed -n '/^--repos$/,$p' | sed '1d')
@@ -334,6 +338,7 @@ cursor_write() {  # <cursor-json-file>
 # read killed at the budget's own deadline counts as exhaustion rather than as a
 # repo that failed.
 BUDGET_EXHAUSTED=0
+RATE_LIMITED=0
 forge() {  # <api-path> <output-file>
   local path=$1 out=$2 remaining bounded=0 rc=0
   remaining=$((DEADLINE - $(date +%s)))
@@ -342,7 +347,13 @@ forge() {  # <api-path> <output-file>
   fm_run_timed "$remaining" env GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
     gh api -H 'Accept: application/vnd.github+json' "$path" > "$out" 2>/dev/null || rc=$?
   [ "$rc" -ne 124 ] || [ "$bounded" -eq 0 ] || BUDGET_EXHAUSTED=1
-  [ "$rc" -eq 0 ] || return 1
+  if [ "$rc" -ne 0 ]; then
+    # A refused allowance is a whole-host condition, not one unreadable repo,
+    # so it is recognized from the error body GitHub documents for 403 and 429.
+    jq -e '(.message? // "") | ascii_downcase
+      | test("rate limit|abuse detection")' "$out" >/dev/null 2>&1 && RATE_LIMITED=1
+    return 1
+  fi
   jq -e 'type == "array"' "$out" >/dev/null 2>&1
 }
 
@@ -516,9 +527,10 @@ qualify() {  # <candidates-in> <repo> <qualified-out>
     | [$markers[] as $m | select(($c.body | ascii_downcase) | contains($m | ascii_downcase)) | $m] as $hit
     | select(($hit | length) > 0)
     | ($c.comment_url | split("#")[0]) as $subject
+    | ($subject | split("/")) as $seg
     | $c + {marker: $hit[0], repository: $repo, subject_url: $subject,
-            subject_type: (if ($subject | test("/pull/")) then "pull" else "issue" end),
-            subject_number: (($subject | split("/") | last | tonumber?) // 0),
+            subject_type: (if $seg[-2] == "pull" then "pull" else "issue" end),
+            subject_number: (($seg[-1] | tonumber?) // 0),
             body: ($c.body[:$cap])}' "$1" > "$3"
 }
 
@@ -595,7 +607,11 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
   since=$(jq -r --arg r "$repo" --arg b "$BACKFILL_SINCE" '.repos[$r] // $b' "$state_json")
   cp "$state_json" "$out" || return 1
   if ! read_repo "$repo" "$since" "$TMP/candidates.jsonl" "$TMP/bound"; then
-    [ "$BUDGET_EXHAUSTED" -eq 1 ] || diag "could not read $repo this cycle; it is retried next cycle"
+    if [ "$RATE_LIMITED" -eq 1 ]; then
+      diag "GitHub refused this host's API allowance, so no watched repository was read this cycle; every gh-backed plane on this host is affected until the allowance resets"
+    elif [ "$BUDGET_EXHAUSTED" -eq 0 ]; then
+      diag "could not read $repo this cycle; it is retried next cycle"
+    fi
     return 1
   fi
   if ! qualify "$TMP/candidates.jsonl" "$repo" "$TMP/qualified.jsonl"; then
@@ -652,7 +668,7 @@ action_poll() {
 }
 
 poll_cycle() {
-  local start repos repo state_json next
+  local start repos repo state_json next swept
   config_require || return 0
   [ "$CFG_ENABLED" = true ] || return 0
   command -v gh >/dev/null 2>&1 || { diag 'gh is required to read watched repositories'; return 0; }
@@ -671,6 +687,8 @@ poll_cycle() {
   fi
   KEEP=${FM_GH_MENTION_KEEP:-500}
   case "$KEEP" in ''|*[!0-9]*|0) KEEP=500 ;; esac
+  MAX_REPOS=${FM_GH_MENTION_MAX_REPOS:-5}
+  case "$MAX_REPOS" in ''|*[!0-9]*|0) MAX_REPOS=5 ;; esac
   repos=$(watched_repos)
   [ -n "$repos" ] || return 0
   mkdir -p "$INBOX" || die 'mention inbox unavailable'
@@ -688,12 +706,15 @@ poll_cycle() {
   jq --argjson live "$LIVE_LOGINS_JSON" '.lapsed = (((.lapsed // []) - $live))' "$state_json" \
     > "$TMP/relive.json" && mv -f -- "$TMP/relive.json" "$state_json"
   next="$TMP/cursor-next.json"
+  swept=0
   while IFS= read -r repo; do
     [ -n "$repo" ] || continue
+    [ "$swept" -lt "$MAX_REPOS" ] || break
     [ "$(date +%s)" -lt "$DEADLINE" ] || break
     poll_repo "$repo" "$state_json" "$start" "$next" || true
+    swept=$((swept + 1))
     mv -f -- "$next" "$state_json"
-    [ "$BUDGET_EXHAUSTED" -eq 0 ] || break
+    [ "$BUDGET_EXHAUSTED" -eq 0 ] && [ "$RATE_LIMITED" -eq 0 ] || break
   done < <(order_by_cursor "$state_json" "$repos")
   cursor_write "$state_json" || diag 'could not record how far the watched repositories were read'
   return 0
@@ -754,7 +775,6 @@ action_status() {
   cursor_read > "$TMP_STATUS"
   grants_describe "$TMP_STATUS" "$(now_iso)" | sed 's/^/  /'
   printf 'markers: %s\n' "$(printf '%s\n' "$CFG_MARKERS" | paste -sd, -)"
-  printf 'may open pr: %s\n' "$CFG_MAY_OPEN_PR"
   printf 'requested watcher interval: %ss\n' "$CFG_INTERVAL"
   unwatched_projects | sed 's/^/unwatched: /'
   repos=$(watched_repos)

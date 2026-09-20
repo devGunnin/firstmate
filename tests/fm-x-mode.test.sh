@@ -917,6 +917,30 @@ test_bootstrap_reports_a_shared_cadence_the_watcher_must_pick_up() {
   pass "bootstrap reports a shared-cadence change the running watcher must pick up"
 }
 
+# fmx_arm_failed settles the shared cadence on its way out, so a cadence that
+# just moved for another plane must be reported there too.
+test_bootstrap_reports_a_cadence_settled_while_relay_arming_failed() {
+  local home out
+  home="$TMP_ROOT/boot-cadence-armfail"; mkdir -p "$home/state" "$home/config"
+  printf 'FMX_PAIRING_TOKEN=tok-armfail\n' > "$home/.env"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  printf 'external shim sentinel\n' > "$home/external-shim"
+  ln -s "$home/external-shim" "$home/state/x-watch.check.sh"
+
+  out=$(PATH="$BASE_PATH" FM_HOME="$home" "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+
+  assert_contains "$out" "FMX: X mode off - failed to arm relay poll shim" \
+    "a refused relay shim is still reported as Relay's own failure"
+  assert_contains "$out" "WATCH_CADENCE: the GitHub mention plane asked for a 30s sweep" \
+    "a cadence settled while relay arming failed must be reported like every other transition"
+  assert_grep "export FM_CHECK_INTERVAL=30" "$home/config/x-mode.env" \
+    "the mention plane's cadence is written even when the relay shim is refused"
+  assert_grep "external shim sentinel" "$home/external-shim" \
+    "the rejected link target must be left untouched"
+  pass "bootstrap reports another plane's cadence settled while relay arming failed"
+}
+
 test_bootstrap_names_the_plane_whose_cadence_it_could_not_settle() {
   local home out
   home="$TMP_ROOT/boot-cadence-unsettled"; mkdir -p "$home/config"
@@ -3221,6 +3245,7 @@ test_bootstrap_keeps_another_planes_cadence_when_x_deps_are_missing
 test_bootstrap_reports_a_cadence_wind_down_without_claiming_relay
 test_bootstrap_reports_a_shared_cadence_the_watcher_must_pick_up
 test_bootstrap_names_the_plane_whose_cadence_it_could_not_settle
+test_bootstrap_reports_a_cadence_settled_while_relay_arming_failed
 test_bootstrap_does_not_announce_when_arm_fails
 test_bootstrap_does_not_follow_x_artifact_symlinks
 test_bootstrap_inert_without_token

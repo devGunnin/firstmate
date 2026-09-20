@@ -1,7 +1,7 @@
 # Validate and flatten config/gh-mentions.json for bin/fm-gh-mention.sh.
 #
 # Prints, on success:
-#   <enabled>\n<may_open_pr>\n<check_interval>
+#   <enabled>\n<check_interval>
 #   \n--trusted\n<one compact grant object per line>
 #   \n--markers\n<marker>...\n--repos\n<owner/name>...
 # and otherwise the single line "invalid: <reason>". There is deliberately no
@@ -44,7 +44,7 @@ def normalize_grant:
   else {login: .login, until: (.until // null), remaining: (.remaining // null)}
   end;
 
-def known: ["enabled", "trusted_logins", "markers", "repos", "may_open_pr", "check_interval"];
+def known: ["enabled", "trusted_logins", "markers", "repos", "check_interval"];
 
 def problem:
   if type != "object" then "must be a JSON object"
@@ -65,8 +65,6 @@ def problem:
     then "needs \"repos\" to be an array when present"
   elif (.repos != null) and any(.repos[]; repo_ok | not)
     then "has a \"repos\" entry that is not owner/name"
-  elif (.may_open_pr != null) and ((.may_open_pr | type) != "boolean")
-    then "needs \"may_open_pr\" to be a boolean when present"
   elif (.check_interval != null) and (.check_interval | interval_ok | not)
     then "needs \"check_interval\" to be a whole number of seconds from 10 to 300 when present"
   else null
@@ -74,11 +72,7 @@ def problem:
 
 if problem then "invalid: " + problem
 else
-  # An absent may_open_pr carries the trusted tag's consent to open a pull
-  # request; `//` cannot express that, because it would read a deliberate
-  # false as absent.
-  [(.enabled | tostring), (if .may_open_pr == null then true else .may_open_pr end | tostring),
-   ((.check_interval // 30) | tostring), "--trusted"]
+  [(.enabled | tostring), ((.check_interval // 30) | tostring), "--trusted"]
   + (.trusted_logins | map(normalize_grant | tojson))
   + ["--markers"] + ((.markers // ["@firstmate", "@captain"]) | map(.))
   + ["--repos"] + ((.repos // []) | map(.))

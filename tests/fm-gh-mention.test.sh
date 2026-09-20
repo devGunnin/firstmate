@@ -33,6 +33,10 @@ case "$path" in
   *) printf '[]\n'; exit 0 ;;
 esac
 repo=$(printf '%s' "$path" | sed -n 's|^repos/\([^/]*\)/\([^/]*\)/.*|\1__\2|p')
+if [ -f "$FM_TEST_GH_DIR/ratelimit" ]; then
+  printf '%s\n' '{"message":"API rate limit exceeded for user ID 1.","documentation_url":"https://docs.github.com/rest/overview/rate-limits"}'
+  exit 1
+fi
 [ -f "$FM_TEST_GH_DIR/fail" ] && exit 1
 if [ -f "$FM_TEST_GH_DIR/$repo.$kind.json" ]; then
   cat "$FM_TEST_GH_DIR/$repo.$kind.json"
@@ -69,7 +73,7 @@ run_plane() {  # <home> <action...>
   FM_TEST_GH_DIR="$home/gh" FM_HOME="$home" PATH="$FAKEBIN:$PATH" "$PLANE" "$@"
 }
 
-DEFAULT_CONFIG='{"enabled":true,"trusted_logins":["devGunnin","mengsig"],"repos":["owner/demo"],"may_open_pr":true}'
+DEFAULT_CONFIG='{"enabled":true,"trusted_logins":["devGunnin","mengsig"],"repos":["owner/demo"]}'
 
 records_in() { find "$1/state/gh-mention-inbox" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' '; }
 # field <record-file> <jq-path>: read one recorded field through jq, so a case
@@ -664,18 +668,78 @@ test_an_unfiled_mention_keeps_the_repo_cursor() {
   pass "fm-gh-mention: a mention that could not be filed is re-derived rather than lost"
 }
 
-test_opening_a_pull_request_is_consented_unless_withheld() {
+# The kind segment names the subject, not the whole URL: a repository literally
+# named `pull` would otherwise hand the responder an issue labelled as a PR.
+test_subject_type_comes_from_the_kind_segment() {
+  local home record
+  home=$(make_home kind-segment \
+    '{"enabled":true,"trusted_logins":["mengsig"],"repos":["wei/pull"]}')
+  canned "$home" wei/pull comments \
+    "[$(comment 901 mengsig '@firstmate look at this issue' \
+      'https://github.com/wei/pull/issues/42#issuecomment-901')]"
+  canned "$home" wei/pull review \
+    "[$(comment 902 mengsig '@firstmate review this' \
+      'https://github.com/wei/pull/pull/7#discussion_r902')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  record="$home/state/gh-mention-inbox/comment-901.json"
+  assert_equals issue "$(field "$record" .subject_type)" \
+    "an issue in a repository named pull must not be recorded as a pull request"
+  assert_equals 42 "$(field "$record" .subject_number)" "the issue keeps its own number"
+  record="$home/state/gh-mention-inbox/review-comment-902.json"
+  assert_equals pull "$(field "$record" .subject_type)" \
+    "a real pull request in the same repository is still a pull request"
+  assert_equals 7 "$(field "$record" .subject_number)" "the pull request keeps its own number"
+  pass "fm-gh-mention: the subject type comes from the kind segment, not the whole URL"
+}
+
+# The hourly GitHub allowance is shared with every other gh-backed plane on this
+# host, so a sweep's cost must be bounded by the cap rather than by how many
+# projects happen to be registered here.
+test_a_sweep_reads_at_most_the_capped_number_of_repositories() {
+  local home repos n id=300 swept
+  repos='"o/r1","o/r2","o/r3","o/r4","o/r5","o/r6","o/r7"'
+  home=$(make_home capped \
+    "{\"enabled\":true,\"trusted_logins\":[\"mengsig\"],\"repos\":[$repos]}")
+  for n in 1 2 3 4 5 6 7; do
+    id=$((id + 1))
+    canned "$home" "o/r$n" comments \
+      "[$(comment "$id" mengsig "@firstmate handle r$n" \
+        "https://github.com/o/r$n/issues/1#issuecomment-$id")]"
+  done
+
+  run_plane "$home" poll >/dev/null 2>&1
+  swept=$(awk -F/ '{print $2"/"$3}' "$home/gh/paths.log" | sort -u | wc -l | tr -d ' ')
+  assert_equals 5 "$swept" "one sweep must read at most the capped number of repositories"
+  assert_equals 15 "$(wc -l < "$home/gh/paths.log" | tr -d ' ')" \
+    "the per-sweep call count is three per capped repository, not three per watched one"
+  assert_equals 5 "$(records_in "$home")" "the repositories that were read file their mentions"
+
+  # The tail has no cursor yet, so it sorts first and is read on the next sweep.
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 7 "$(records_in "$home")" \
+    "a watched set larger than the cap rotates across sweeps instead of starving its tail"
+  pass "fm-gh-mention: a sweep reads at most the capped number of repositories and rotates"
+}
+
+# An exhausted allowance is a whole-host condition; reporting it as one
+# unreadable repository sends the captain after the wrong fault.
+test_a_refused_allowance_is_named_as_itself() {
   local home out
-  home=$(make_home consent-default '{"enabled":true,"trusted_logins":["mengsig"]}')
-  out=$(run_plane "$home" status 2>&1)
-  assert_contains "$out" "may open pr: true" \
-    "the minimal configuration carries the trusted tag's consent to open a pull request"
-  home=$(make_home consent-withheld \
-    '{"enabled":true,"trusted_logins":["mengsig"],"may_open_pr":false}')
-  out=$(run_plane "$home" status 2>&1)
-  assert_contains "$out" "may open pr: false" \
-    "a home that deliberately withholds pull-request opening still can"
-  pass "fm-gh-mention: opening a pull request is consented unless deliberately withheld"
+  home=$(make_home rate-limited \
+    '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/a","o/b","o/c"]}')
+  : > "$home/gh/ratelimit"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" "refused this host's API allowance" \
+    "a refused allowance must be named as itself, not as one unreadable repository"
+  assert_not_contains "$out" "could not read o/" \
+    "a refused allowance must not be reported as a per-repository read failure"
+  assert_equals 1 "$(printf '%s\n' "$out" | grep -c 'API allowance')" \
+    "the whole-host condition is reported once, not once per watched repository"
+  assert_equals 1 "$(wc -l < "$home/gh/paths.log" | tr -d ' ')" \
+    "a refused allowance stops at the call that was refused instead of spending more"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals '' "$out" "a standing allowance refusal keeps report-once semantics"
+  pass "fm-gh-mention: a refused API allowance is named as itself and stops the sweep"
 }
 
 test_help_and_usage
@@ -711,4 +775,6 @@ test_a_full_page_stops_the_cursor_where_the_read_stopped
 test_a_failed_read_keeps_the_repo_cursor
 test_a_persistent_failure_is_reported_once
 test_an_unfiled_mention_keeps_the_repo_cursor
-test_opening_a_pull_request_is_consented_unless_withheld
+test_subject_type_comes_from_the_kind_segment
+test_a_sweep_reads_at_most_the_capped_number_of_repositories
+test_a_refused_allowance_is_named_as_itself
