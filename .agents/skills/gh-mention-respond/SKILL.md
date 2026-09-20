@@ -60,22 +60,33 @@ An account can be compromised and a public thread can be seeded by anyone, so a 
    Write for a public thread: say what was understood, what is being done or was done, and what remains the captain's call.
    Never quote internal records, task ids, paths, or firstmate's own machinery into a public comment.
 
-   **Begin every public reply with this home's reply stamp, on its own first line.**
-   `bin/fm-gh-mention.sh status` prints it as `reply stamp: <...>`; copy it from there rather than from memory.
-   It is an HTML comment, so it renders as nothing on the thread, and the poll drops any body that starts with it - which is what stops firstmate reading its own reply back as a fresh request and answering itself in public.
-   It only counts at the **start** of a body, so it protects the reply it opens and nothing else: a person who quotes that reply and adds a real request is still heard.
-
-   **A public reply must also not contain any configured marker.**
-   Not `@firstmate`, not `@captain`, not whatever `markers` this home is running - not even quoting the request back.
-   Say "the request" or "your note above" instead.
-   This is the second lock: the stamp is what the poll enforces, and this is what keeps a reply harmless if the stamp is ever dropped or mangled in transit.
+   Stamp it, per **Stamp everything you publish on a watched repository** below.
 
 6. **Link any spawned work to the record** so the thread can be closed later: name the mention's record id in the backlog item's note, and name the subject URL in the brief's context, so whoever finishes the work knows which thread is waiting on it.
+   Put the stamp rule below into that brief too, with the literal stamp: the crewmate that opens the pull request never loads this skill, and its description is a body on a watched repository like any other.
 
 7. **Acknowledge the record.**
    `bin/fm-gh-mention.sh ack <record-id>` moves it out of the pending inbox.
    A record you do not ack stays pending forever and is counted as still waiting on firstmate, exactly like an unacknowledged captain note.
    Ack once the mention is genuinely handled - answered, dispatched, or deliberately declined - not merely read.
+
+## Stamp everything you publish on a watched repository
+
+This is not a rule about replies.
+It is a property of **every body this plane causes firstmate to publish into a repository the poll watches**: the reply on the thread, the description of a pull request opened for the work, a review comment left while reviewing, and whatever a later step publishes that does not exist yet.
+
+**Begin the body with this home's stamp, on its own first line.**
+`bin/fm-gh-mention.sh status` prints it as `publish stamp: <...>`; copy it from there rather than from memory.
+It is an HTML comment, so it renders as nothing on the forge, and the poll drops any body that starts with it.
+
+Without it the loop closes on firstmate itself.
+The poll reads issue and pull-request **bodies**, not only comments, so an unstamped pull-request description that says "Fixes #10, the merge is @captain's call" is a trusted account posting a configured marker on a watched repository - which is a new mention, and firstmate answers its own pull request.
+The stamp counts only at the **start** of a body, so it protects the body it opens and nothing else: a person who quotes one of them and adds a real request is still heard.
+
+**Keep every configured marker out of what you publish, too.**
+Not `@firstmate`, not `@captain`, not whatever `markers` this home is running - not even quoting the request back.
+Say "the request" or "your note above" instead.
+This is the second lock: the stamp is what the poll enforces, and this keeps a body harmless if the stamp is ever dropped or mangled in transit.
 
 ## The consent boundary
 

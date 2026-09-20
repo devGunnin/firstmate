@@ -218,7 +218,7 @@ test_a_body_opened_while_the_cursor_was_behind_is_still_filed() {
 test_a_stamped_reply_never_qualifies() {
   local home stamp
   home=$(make_home stamped '{"enabled":true,"trusted_logins":["mengsig","devGunnin"],"repos":["o/r"]}')
-  stamp=$(run_plane "$home" status | sed -n 's/^reply stamp: //p')
+  stamp=$(run_plane "$home" status | sed -n 's/^publish stamp: //p')
   [ -n "$stamp" ] || fail "status must publish the stamp the responder has to write"
   canned "$home" o/r comments \
     "[$(comment 501 mengsig "$stamp
@@ -261,7 +261,7 @@ test_every_authorized_account_can_still_tag() {
 test_a_stamped_reply_quoted_inside_a_request_still_qualifies() {
   local home stamp
   home=$(make_home stamp-quoted '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/r"]}')
-  stamp=$(run_plane "$home" status | sed -n 's/^reply stamp: //p')
+  stamp=$(run_plane "$home" status | sed -n 's/^publish stamp: //p')
   canned "$home" o/r comments \
     "[$(comment 521 mengsig "> $stamp
 > Picked up the request above.
@@ -275,6 +275,38 @@ That fix missed the nested case - @firstmate please take another look." \
     "quoting a stamped reply and adding a real request is still a request"
   assert_equals 1 "$(wakes_in "$home")" "the quoted-and-asked request queues its wake"
   pass "fm-gh-mention: a stamped reply quoted inside a request still qualifies"
+}
+
+# The poll reads issue and pull-request bodies from the same listing, so the
+# pull request firstmate opens for the work is a candidate like any other. An
+# unstamped description saying the merge is the captain's call is a trusted
+# account posting a marker on a watched repository - a new mention, which is
+# firstmate answering its own pull request.
+test_a_stamped_pull_request_body_never_qualifies() {
+  local home stamp
+  home=$(make_home stamped-pr '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/r"]}')
+  stamp=$(run_plane "$home" status | sed -n 's/^publish stamp: //p')
+  [ -n "$stamp" ] || fail "status must publish the stamp the responder has to write"
+
+  # Positive control first: without the stamp that body IS a mention, which is
+  # what makes the stamped case below evidence rather than a vacuous pass.
+  canned "$home" o/r issues \
+    "[$(comment 701 mengsig "Fixes #10. The merge is @captain's call." \
+      'https://github.com/o/r/pull/11')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_present "$home/state/gh-mention-inbox/issue-701.json" \
+    "an unstamped pull-request body carrying a marker does reach the plane"
+
+  canned "$home" o/r issues \
+    "[$(comment 702 mengsig "$stamp
+
+Fixes #12. The merge is @captain's call." \
+      'https://github.com/o/r/pull/13')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_absent "$home/state/gh-mention-inbox/issue-702.json" \
+    "a pull-request body firstmate opened must not be read back as a request"
+  assert_equals 1 "$(wakes_in "$home")" "only the unstamped one ever queued a wake"
+  pass "fm-gh-mention: a stamped pull-request body never qualifies"
 }
 
 test_help_and_usage() {
@@ -1013,3 +1045,4 @@ test_a_body_opened_while_the_cursor_was_behind_is_still_filed
 test_a_stamped_reply_never_qualifies
 test_every_authorized_account_can_still_tag
 test_a_stamped_reply_quoted_inside_a_request_still_qualifies
+test_a_stamped_pull_request_body_never_qualifies

@@ -671,14 +671,15 @@ The marker is what separates a request meant for firstmate from ordinary convers
 Because only the body's own author is checked, a marker quoted from an untrusted account never qualifies on its own.
 A trusted collaborator who posts a body carrying a marker authored it deliberately - quote-reply included - so it is treated as a request, which is what it is.
 
-**firstmate's own replies are excluded by a stamp, not by who posted them.**
-firstmate answers a mention by commenting on the thread, and a reply that restates the ask would carry a marker - so without this the next sweep would read that reply back as a fresh mention and answer itself in public.
-Every public reply therefore begins with a fixed stamp, an HTML comment that renders as nothing on the thread, and the poll drops any body that starts with it.
-`bin/fm-gh-mention.sh status` prints the stamp this home uses.
+**What firstmate publishes is excluded by a stamp, not by who posted it.**
+firstmate answers a mention by commenting on the thread, opens pull requests for the work it dispatches, and leaves review comments - and any of those bodies would carry a marker if it restates the ask, so without this the next sweep would read firstmate's own work back as a fresh mention and answer itself in public.
+Every body this plane causes firstmate to publish on a watched repository therefore begins with a fixed stamp, an HTML comment that renders as nothing on the forge, and the poll drops any body that starts with it.
+That covers pull-request descriptions as well as comments, because the poll reads issue and pull-request bodies from the same listing.
+`bin/fm-gh-mention.sh status` prints the stamp this home uses, and `.agents/skills/gh-mention-respond/SKILL.md` carries it into the brief of any crewmate that opens the pull request.
 
-Recognising its own replies by what it writes rather than by which account posts them is what keeps every authorized login able to tag: it does not matter whether this home is signed in as `mengsig`, as `devGunnin`, or as a dedicated bot account, and re-authenticating it later changes nothing.
-The stamp counts only at the **start** of a body, so it protects the reply it opens and nothing else - a collaborator who quotes one of those replies and adds a real request is still heard.
-`.agents/skills/gh-mention-respond/SKILL.md` additionally forbids any configured marker in a public reply, which keeps a reply harmless if the stamp is ever dropped.
+Recognising its own work by what it writes rather than by which account posts it is what keeps every authorized login able to tag: it does not matter whether this home is signed in as `mengsig`, as `devGunnin`, or as a dedicated bot account, and re-authenticating it later changes nothing.
+The stamp counts only at the **start** of a body, so it protects the body it opens and nothing else - a collaborator who quotes one of them and adds a real request is still heard.
+The same skill additionally forbids any configured marker in what firstmate publishes, which keeps a body harmless if the stamp is ever dropped.
 Everything that does not qualify is ignored silently: no record, no wake, and no write to GitHub.
 Authorizing a collaborator is exactly adding their login to `trusted_logins`, and every listed login carries the same authority.
 A bound limits how long or how often an account may ask, never what it may ask for, so per-account authority tiers do not exist.
@@ -807,7 +808,7 @@ Because the file is shared, a transition to it is reported as a `WATCH_CADENCE:`
 A home that never opted into Relay is therefore never told Relay removed or failed to remove something, and a cadence write that fails names the plane left polling at the default 300 seconds.
 Every transition is reported the same way - a plane opting in, and the wind-down when the last one is turned off - and each carries the supervision-repair pointer, because a watcher already running keeps sweeping at its start-time interval until it is restarted.
 Re-confirming an unchanged interval is not a transition and says nothing, so a home in steady state hears about the cadence only when it actually moves.
-That holds on a home where Relay itself arms too: its `FMX: X mode on` line names the interval on every session start whether or not anything moved, so the `WATCH_CADENCE:` line is what actually marks the transition and carries the repair pointer.
+That holds on a home where Relay itself arms too: its `FMX: X mode on` line repeats on every session start whether or not anything moved, so it is not a transition marker - the `WATCH_CADENCE:` line is what marks the transition and carries the repair pointer.
 
 ## Relay (.env)
 

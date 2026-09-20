@@ -32,9 +32,9 @@
 # checked, so a marker quoted from an untrusted account never qualifies on its
 # own; a trusted collaborator who posts a body carrying a marker - including by
 # quote-reply - authored that body deliberately, and it is treated as a request,
-# which is correct rather than a gap. The one body kind excluded is firstmate's
-# own reply, recognized by the REPLY_STAMP it begins with rather than by who
-# posted it, so every authorized account stays able to tag.
+# which is correct rather than a gap. What is excluded is a body firstmate
+# published itself, recognized by the PUBLISH_STAMP it begins with rather than
+# by who posted it, so every authorized account stays able to tag.
 # Everything else is ignored silently: no record, no wake, no forge write.
 # Authorizing a collaborator is exactly adding their login to `trusted_logins`,
 # and every listed login carries the same authority.
@@ -152,11 +152,12 @@ LOCK="$STATE/.gh-mention.lock"
 CURSOR_SCHEMA=fm-gh-mention-cursor.v1
 RECORD_SCHEMA=fm-gh-mention.v1
 BODY_MAX=4000
-# What firstmate's own public replies begin with. The responder contract writes
-# it; the poll reads it back and never treats a body carrying it as a request,
-# which is what stops firstmate answering its own reply. It is an HTML comment,
-# so it renders as nothing on the forge.
-REPLY_STAMP='<!-- firstmate:gh-mention -->'
+# What every body firstmate publishes on a watched repo begins with - a thread
+# reply, a pull-request description, a review comment, anything a later step
+# adds. The responder contract writes it; the poll reads it back and never
+# treats a body carrying it as a request, which is what stops firstmate
+# answering its own work. It is an HTML comment, so it renders as nothing.
+PUBLISH_STAMP='<!-- firstmate:gh-mention -->'
 PER_PAGE=100
 WATCH_INTERVAL=30
 
@@ -328,14 +329,16 @@ registry_repos() {
 
 # The watched set: every resolvable registered project plus every repo the
 # config lists outright, deduped into a stable order.
-watched_repos() {
-  { registry_repos | awk -F'\t' '$1 == "repo" { print $2 }'; printf '%s\n' "$CFG_REPOS"; } \
+watched_repos_from() {  # <registry-rows>
+  { printf '%s\n' "$1" | awk -F'\t' '$1 == "repo" { print $2 }'; printf '%s\n' "$CFG_REPOS"; } \
     | sed '/^$/d' | sort -u
 }
 
+watched_repos() { watched_repos_from "$(registry_repos)"; }
+
 # One human-readable line per registered project that contributes no repository.
-unwatched_projects() {
-  registry_repos | awk -F'\t' \
+registry_skip_rows() {  # <registry-rows>
+  printf '%s\n' "$1" | awk -F'\t' \
     '$1 == "skip" { printf "registered project %s %s; it is not watched\n", $2, $3 }'
 }
 
@@ -562,15 +565,18 @@ grant_charge() {  # <author-login> <record-id> <cursor-json> <now-iso>
 # its own author is trusted AND its own body carries a configured marker AND
 # that body is not one firstmate wrote itself.
 #
-# Its own reply is recognized by the stamp it begins with, never by who posted
-# it: a home signs in as whatever account the captain gave it, and every account
-# on `trusted_logins` must stay able to tag. The stamp counts only at the START
-# of a body, so quoting an earlier reply and adding a real request is still a
+# Its own work is recognized by the stamp the body begins with, never by who
+# posted it: a home signs in as whatever account the captain gave it, and every
+# account on `trusted_logins` must stay able to tag. This covers every body
+# firstmate publishes, not just a thread reply - the issues listing carries
+# pull-request descriptions too, so an unstamped PR body saying the merge is
+# @captain's call would be a fresh mention. The stamp counts only at the START
+# of a body, so quoting an earlier one and adding a real request is still a
 # request - which is the common case on a thread firstmate is already on.
 qualify() {  # <candidates-in> <repo> <qualified-out>
   jq -c --arg repo "$2" --argjson trusted "$LIVE_LOGINS_JSON" \
     --argjson markers "$CFG_MARKERS_JSON" --argjson cap "$BODY_MAX" \
-    --arg stamp "$REPLY_STAMP" '
+    --arg stamp "$PUBLISH_STAMP" '
     . as $c
     | select(($c.body | sub("^[[:space:]]+"; "") | startswith($stamp)) | not)
     | ($c.author | ascii_downcase) as $login
@@ -820,7 +826,7 @@ action_ack() {  # <record-id>
 }
 
 action_status() {
-  local rc=0 repos pending=0
+  local rc=0 rows repos pending=0
   config_load || rc=$?
   TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-gh-mention.XXXXXX") || die 'no scratch directory'
   TMP_STATUS="$TMP/cursor.json"
@@ -833,9 +839,10 @@ action_status() {
   cursor_read > "$TMP_STATUS"
   grants_describe "$TMP_STATUS" "$(now_iso)" | sed 's/^/  /'
   printf 'markers: %s\n' "$(printf '%s\n' "$CFG_MARKERS" | paste -sd, -)"
-  printf 'reply stamp: %s\n' "$REPLY_STAMP"
-  unwatched_projects | sed 's/^/unwatched: /'
-  repos=$(watched_repos)
+  printf 'publish stamp: %s\n' "$PUBLISH_STAMP"
+  rows=$(registry_repos)
+  registry_skip_rows "$rows" | sed 's/^/unwatched: /'
+  repos=$(watched_repos_from "$rows")
   if [ -z "$repos" ]; then
     printf 'watched repositories: none - nothing to watch until a project is registered here or a repo is listed in config/gh-mentions.json\n'
   else
@@ -867,10 +874,11 @@ action_cadence() {
 # line can never force a skill load every session; `status` lists the whole
 # picture on demand either way.
 watched_set_report() {
-  local current previous line
+  local rows current previous line
+  rows=$(registry_repos)
   current=$(
-    unwatched_projects
-    [ -n "$(watched_repos)" ] \
+    registry_skip_rows "$rows"
+    [ -n "$(watched_repos_from "$rows")" ] \
       || printf '%s\n' 'nothing to watch yet - no project registered here resolves to a GitHub repository and config/gh-mentions.json lists no repos'
   )
   previous=$(report_record_read "$WATCHED_SET_RECORD")
