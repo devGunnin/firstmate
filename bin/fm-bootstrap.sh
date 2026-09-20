@@ -22,7 +22,8 @@
 #                 "BOOTSTRAP_INFO: nudged fm-<id> with '<message>'",
 #                 "SECONDMATE_LIVENESS: secondmate <id>: skipped: <reason>|respawn failed after <cause>: <reason>",
 #                 "SECONDMATE_HANDOFF: secondmate <id>: pending delivery: <n> item(s)",
-#                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "GH_MENTIONS: <what stops or limits the GitHub mention poll>".
 #          When a RUNNING secondmate home is fast-forwarded, its target is
 #          firstmate's own current default-branch commit. A local worktree uses
 #          a purely local fast-forward with no origin fetch; a remote route hands
@@ -101,10 +102,15 @@
 #          The `code-root <file>` variant is a detect-only local check that runs
 #          even in a read-only session; detect_code_root_backlog_fork owns what
 #          it reports.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the six MUTATING sweeps
+#          GitHub mentions are OPTIONAL and inert unless config/gh-mentions.json
+#          exists; when it does, bootstrap keeps the mention poll armed exactly
+#          while that file says it should be, and prints a GH_MENTIONS line for
+#          anything that stops or limits it. docs/configuration.md
+#          "GitHub mentions" owns the schema.
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the seven MUTATING sweeps
 #          (backlog_record_reconcile, secondmate_sync,
 #          secondmate_liveness_sweep, secondmate_handoff_resume, x_mode_setup,
-#          fleet_sync) while still
+#          gh_mentions_setup, fleet_sync) while still
 #          printing every read-only detect line
 #          above; the TANGLE line switches to advisory-only wording with no
 #          checkout command. Used by
@@ -125,8 +131,8 @@
 #                 secondmate_handoff_resume, and fleet_sync.
 #            only - ONLY those network steps and nothing else. No tool detection,
 #                 no version floors, no tangle check, no backlog
-#                 reconciliation, no x_mode_setup: those already ran on the
-#                 local pass.
+#                 reconciliation, no x_mode_setup, no gh_mentions_setup: those
+#                 already ran on the local pass.
 #          FM_BOOTSTRAP_DETECT_ONLY composes with it unchanged, so `only` plus
 #          detect-only is the read-only `gh auth status` probe on its own.
 #          bin/fm-startup-network.sh owns the deferral: it runs the `only` phase
@@ -1109,6 +1115,39 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+# GitHub mentions (opt-in): keep this home's mention poll armed exactly while
+# config/gh-mentions.json says it should be. bin/fm-gh-mention.sh owns every
+# decision and message here - arming, its refusals, and what it cannot watch -
+# so bootstrap only decides whether to ask and relays the answer as GH_MENTIONS
+# lines. Absent configuration is a complete no-op, and a configuration that
+# stops the plane also retires any shim a previous session armed, so the watcher
+# never keeps polling a plane the captain turned off or broke.
+gh_mentions_setup() {
+  local plane="$SCRIPT_DIR/fm-gh-mention.sh" shim="$STATE/gh-mention.check.sh" out line rc=0
+  [ -x "$plane" ] || return 0
+  if [ ! -e "$CONFIG/gh-mentions.json" ]; then
+    x_mode_artifact_present "$shim" || return 0
+    "$plane" disarm >/dev/null 2>&1 \
+      || echo "GH_MENTIONS: could not retire the mention poll after its configuration was removed"
+    return 0
+  fi
+  out=$("$plane" arm 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ] && x_mode_artifact_present "$shim" \
+    && ! "$plane" disarm >/dev/null 2>&1; then
+    echo "GH_MENTIONS: could not retire the mention poll this home cannot arm"
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      ''|'armed: '*|'disarmed: '*) ;;
+      'gh-mention: '*) echo "GH_MENTIONS: ${line#gh-mention: }" ;;
+      'fm-gh-mention: '*) echo "GH_MENTIONS: ${line#fm-gh-mention: }" ;;
+      *) echo "GH_MENTIONS: $line" ;;
+    esac
+  done <<EOF
+$out
+EOF
+}
+
 crew_dispatch_validate() {
   local file err verified_harnesses typed_key typed_active=false
   file="$CONFIG/crew-dispatch.json"
@@ -1656,6 +1695,9 @@ if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   fi
   # x_mode_setup writes local Relay artifacts only and never leaves the machine.
   local_phase && x_mode_setup
+  # gh_mentions_setup only arms or retires a local check shim; the poll it arms
+  # is what talks to GitHub, on the watcher's own cadence.
+  local_phase && gh_mentions_setup
   # Adopt existing durable contribution links without making a network call.
   # Detection-only startup must never publish a check registration.
   if local_phase && command -v jq >/dev/null 2>&1 \

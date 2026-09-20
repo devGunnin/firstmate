@@ -30,10 +30,11 @@
 #                       mutating step runs.
 #   2. bootstrap      - home-local stale Herdr projection cleanup runs only
 #                       when this session actually holds the lock. Detect-only
-#                       diagnostics always run. Bootstrap's six MUTATING sweeps
+#                       diagnostics always run. Bootstrap's seven MUTATING sweeps
 #                       (same-home backlog reconciliation,
 #                       secondmate convergence, secondmate liveness, pending remote
-#                       handoff retry, X-mode artifact writes, fleet sync) also run only when
+#                       handoff retry, X-mode artifact writes, GitHub mention poll
+#                       arming, fleet sync) also run only when
 #                       locked; the four network sweeps run in the deferred
 #                       stage rather than this synchronous bootstrap section.
 #   3. wake-drain     - presents durable wakes and advances recovery handling

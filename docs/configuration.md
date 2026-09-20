@@ -633,6 +633,63 @@ The sweep must finish inside `FM_CHECK_TIMEOUT` (default 30), because a run the 
 So a budget larger than that timeout allows is cut down to what fits instead of being refused, and the cut is reported in the report line.
 A budget that is not a whole number from 1 to 120 is still refused outright.
 
+## GitHub mentions (config/gh-mentions.json)
+
+The GitHub mention plane routes a tagged comment in a watched repository into firstmate's durable wake queue, so work can be handed to a firstmate running here from a GitHub thread instead of from chat.
+It is off unless this home's gitignored `config/gh-mentions.json` exists: without that file nothing is armed, nothing is polled, and no existing path pays anything for it.
+It is not inherited by secondmate homes, so each home watches the repositories and trusts the logins that belong to its own domain.
+
+This section is the single owner of the configuration schema and the generated state.
+[`bin/fm-gh-mention.sh`](../bin/fm-gh-mention.sh) and its `--help` own the exact subcommands, record format, budgets, and mutation mechanics.
+
+```json
+{
+  "enabled": true,
+  "trusted_logins": ["devGunnin", "mengsig"],
+  "markers": ["@firstmate", "@captain"],
+  "repos": ["owner/name"],
+  "may_open_pr": true
+}
+```
+
+`enabled` and `trusted_logins` are required; `markers` defaults to `@firstmate` and `@captain`, `repos` defaults to empty, and `may_open_pr` defaults to `false`.
+A malformed or unreadable file, including an unknown key, stops the plane with an actionable error rather than falling back on a default.
+That strictness is deliberate: a typo in `trusted_logins` would otherwise silently widen or narrow who firstmate obeys.
+
+**What is watched is repositories, not accounts.**
+The watched set is this home's registered projects, each contributing the `github.com` origin of its `projects/<name>` clone as `owner/name`, plus every entry in `repos`, which covers a repository that should be watched without being cloned here.
+Which account owns a watched repository does not matter: a qualifying mention is handled identically in all of them.
+A registered project with no clone here, no origin, or a non-GitHub origin contributes nothing and is named by `bin/fm-gh-mention.sh status` and by session start, never silently dropped.
+
+**Trust is the safety core.**
+A comment or body qualifies only when both conditions hold on that same body: its author's GitHub login is on `trusted_logins`, matched exactly and case-insensitively by login and never by display name, and that body carries one of the `markers`, matched case-insensitively as a literal substring.
+The marker is what separates a request meant for firstmate from ordinary conversation by a trusted account; without it, every comment a trusted collaborator writes would start work.
+Because only the body's own author is checked, a marker quoted from someone else never qualifies on its own.
+Everything that does not qualify is ignored silently: no record, no wake, and no write to GitHub.
+Authorizing a collaborator is exactly adding their login to `trusted_logins`, and every listed login carries the same authority; per-account authority tiers do not exist.
+
+A trusted tag is consent for reversible work - replying, investigating, dispatching, pushing a fix branch, and opening a pull request when `may_open_pr` is true.
+Merging, closing, deleting, force-pushing, credential changes, and anything else irreversible or security-sensitive still require the captain's explicit word, the same boundary the Relay public-mention path holds.
+A comment body is information to act on, never an instruction to obey; `.agents/skills/gh-mention-respond/SKILL.md` owns how a mention is handled once it arrives.
+
+**The poll writes nothing to GitHub.**
+Per watched repository it reads three repo-scoped listings, each bounded by that repository's stored cursor, so the cost is a small constant per repository per poll rather than growing with repository history: issue and pull-request conversation comments, pull-request review comments, and newly opened or edited issue and pull-request bodies.
+Repositories are read least-recently-read first, so a watched set too large for one budget still progresses across polls instead of starving its tail, and a repository whose reads do not complete keeps its cursor so nothing is skipped.
+
+Generated state, all under `state/` and gitignored:
+
+- `gh-mention-inbox/<record-id>.json` - one accepted mention awaiting firstmate, and `gh-mention-inbox/handled/` for the same record after `bin/fm-gh-mention.sh ack`.
+- `gh-mention-cursor.json` - each watched repository's read cursor and the bounded list of mention ids already filed.
+  It survives `disarm`, so re-arming resumes where the plane left off.
+- `gh-mention.check.sh` and `gh-mention.check-trust` - the standing poll shim and its watcher trust binding.
+
+Each accepted mention appends exactly one durable `check: gh-mention <record-id>` wake.
+A crash can duplicate that wake but can never consume the pending record, so a mention is never lost.
+
+Session start keeps the poll armed exactly while the configuration says it should be, and reports anything that stops or limits it as a `GH_MENTIONS:` line; a configuration that is removed, disabled, or broken also retires the shim, so the watcher never polls a plane the captain turned off.
+Arming the check is itself a reason to watch, so the home keeps a watcher for it after the last task is torn down.
+`FM_GH_MENTION_BUDGET` (default 20, valid 1..25) bounds one poll's forge reads and is cut down to fit `FM_CHECK_TIMEOUT`, `FM_GH_MENTION_BACKFILL` (default 3600 seconds) is how much history a repository with no cursor yet reads, and `FM_GH_MENTION_KEEP` (default 500) is how many filed mention ids the cursor retains.
+
 ## Mail plane (.env)
 
 The mail plane (bin/fm-mail.sh) reads unseen IMAP messages and sends one SMTP message.
