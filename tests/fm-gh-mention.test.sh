@@ -379,6 +379,175 @@ test_review_comments_and_bodies_qualify_too() {
   pass "fm-gh-mention: review comments and issue or PR bodies qualify alongside comments"
 }
 
+test_a_plain_login_entry_is_a_permanent_authorization() {
+  local home
+  home=$(make_home permanent "$DEFAULT_CONFIG")
+  canned "$home" owner/demo comments \
+    "[$(comment 301 mengsig '@firstmate one' 'https://github.com/owner/demo/issues/1#issuecomment-301')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  canned "$home" owner/demo comments \
+    "[$(comment 302 mengsig '@firstmate two' 'https://github.com/owner/demo/issues/1#issuecomment-302')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 2 "$(records_in "$home")" "a plain login keeps qualifying with no bound to spend"
+  assert_equals '{}' "$(jq -c '.grants // {}' "$home/state/gh-mention-cursor.json")" \
+    "a plain login spends nothing"
+  assert_contains "$(run_plane "$home" status)" "mengsig - permanent" \
+    "status names a plain login as a permanent authorization"
+  pass "fm-gh-mention: a plain login entry stays a permanent authorization"
+}
+
+test_an_expiry_in_the_past_never_qualifies() {
+  local home out
+  home=$(make_home expired \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","until":"2020-01-01T00:00:00Z"}],"repos":["o/r"]}')
+  canned "$home" o/r comments \
+    "[$(comment 311 guest '@firstmate please look' 'https://github.com/o/r/issues/1#issuecomment-311')]"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals 0 "$(records_in "$home")" "an expired authorization files no record"
+  assert_equals 0 "$(wakes_in "$home")" "an expired authorization queues no wake"
+  assert_contains "$out" "has lapsed" "the lapsed authorization is reported"
+  assert_contains "$out" "expired at 2020-01-01T00:00:00Z" "the report names the expiry it passed"
+  pass "fm-gh-mention: an authorization whose expiry has passed never qualifies"
+}
+
+test_a_count_bounded_grant_stops_at_zero() {
+  local home out id=400
+  home=$(make_home counted \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","remaining":2}],"repos":["o/r"]}')
+  canned "$home" o/r comments \
+    "[$(comment 401 guest '@firstmate first' 'https://github.com/o/r/issues/1#issuecomment-401'),
+      $(comment 402 guest '@firstmate second' 'https://github.com/o/r/issues/2#issuecomment-402'),
+      $(comment 403 guest '@firstmate third' 'https://github.com/o/r/issues/3#issuecomment-403')]"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals 2 "$(records_in "$home")" "a grant of two funds exactly two accepted mentions"
+  assert_absent "$home/state/gh-mention-inbox/comment-403.json" \
+    "the mention past the bound is refused inside the same poll"
+  assert_equals 2 "$(jq -r '.grants.guest.spent_on | length' "$home/state/gh-mention-cursor.json")" \
+    "the spend is recorded durably, once per accepted mention"
+  pass "fm-gh-mention: a count-bounded authorization stops qualifying at zero"
+}
+
+test_the_count_decrements_only_on_acceptance() {
+  local home
+  home=$(make_home spend-once \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","remaining":5}],"repos":["o/r"]}')
+  # One qualifying comment, plus two that are scanned but never accepted: an
+  # unmarked comment from the same account, and a marked one from a stranger.
+  canned "$home" o/r comments \
+    "[$(comment 411 guest '@firstmate do this' 'https://github.com/o/r/issues/1#issuecomment-411'),
+      $(comment 412 guest 'just chatting' 'https://github.com/o/r/issues/1#issuecomment-412'),
+      $(comment 413 stranger '@firstmate do this too' 'https://github.com/o/r/issues/1#issuecomment-413')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 1 "$(records_in "$home")" "only the qualifying comment is accepted"
+  assert_equals 1 "$(jq -r '.grants.guest.spent_on | length' "$home/state/gh-mention-cursor.json")" \
+    "the count spends once per accepted mention, not per comment scanned"
+  # A second poll re-scans the same comments and must not spend again.
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 1 "$(jq -r '.grants.guest.spent_on | length' "$home/state/gh-mention-cursor.json")" \
+    "a repeated poll over the same comments spends nothing further"
+  pass "fm-gh-mention: a bounded count decrements only on an accepted mention"
+}
+
+test_a_lapsed_grant_is_reported_once() {
+  local home out
+  home=$(make_home lapse-once \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","remaining":1}],"repos":["o/r"]}')
+  canned "$home" o/r comments \
+    "[$(comment 421 guest '@firstmate only one' 'https://github.com/o/r/issues/1#issuecomment-421')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 1 "$(records_in "$home")" "the single authorized request is accepted"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" "has lapsed" "the exhausted authorization is reported when it lapses"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_not_contains "$out" "has lapsed" "a lapsed authorization is reported once, not every poll"
+  # Renewing it makes it live again, and reportable again if it lapses later.
+  printf '%s\n' '{"enabled":true,"trusted_logins":[{"login":"guest","remaining":2}],"repos":["o/r"]}' \
+    > "$home/config/gh-mentions.json"
+  canned "$home" o/r comments \
+    "[$(comment 422 guest '@firstmate renewed' 'https://github.com/o/r/issues/2#issuecomment-422')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_present "$home/state/gh-mention-inbox/comment-422.json" "a renewed authorization qualifies again"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" "has lapsed" "a renewed authorization is reportable again once it lapses"
+  pass "fm-gh-mention: a lapsed authorization is reported once and again after renewal"
+}
+
+test_a_retried_mention_is_never_charged_twice() {
+  local home
+  home=$(make_home recharge \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","remaining":2}],"repos":["o/r"]}')
+  canned "$home" o/r comments \
+    "[$(comment 441 guest '@firstmate once' 'https://github.com/o/r/issues/1#issuecomment-441')]"
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 1 "$(jq -r '.grants.guest.spent_on | length' "$home/state/gh-mention-cursor.json")" \
+    "the accepted mention is charged once"
+  # A poll that died after charging but before remembering the mention leaves
+  # exactly this state; the retry must re-derive the same mention and charge
+  # nothing further, or a crash would quietly spend a bounded trial twice.
+  jq '.repos = {} | .processed = []' "$home/state/gh-mention-cursor.json" > "$home/c.json"
+  mv "$home/c.json" "$home/state/gh-mention-cursor.json"
+  rm -f "$home/state/gh-mention-inbox"/*.json
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_present "$home/state/gh-mention-inbox/comment-441.json" "the retry re-files the same mention"
+  assert_equals 1 "$(jq -r '.grants.guest.spent_on | length' "$home/state/gh-mention-cursor.json")" \
+    "a retried mention is charged once, not twice"
+  assert_contains "$(run_plane "$home" status)" "1 of 2 requests left" \
+    "the grant still has its second request"
+  pass "fm-gh-mention: a retried mention is never charged to a grant twice"
+}
+
+test_an_unspendable_bound_refuses_the_mention() {
+  local home out
+  home=$(make_home unspendable \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","remaining":3}],"repos":["o/r"]}')
+  canned "$home" o/r comments \
+    "[$(comment 431 guest '@firstmate urgent' 'https://github.com/o/r/issues/1#issuecomment-431')]"
+  # A cursor the plane refuses to write through - here a symlink out of the
+  # state directory - means the spend cannot be made durable. Accepting anyway
+  # would act on a bound nobody can verify, so the mention must be refused.
+  mkdir -p "$home/elsewhere"
+  jq -n '{schema:"fm-gh-mention-cursor.v1",repos:{},processed:[],grants:{},lapsed:[]}' \
+    > "$home/elsewhere/cursor.json"
+  ln -s "$home/elsewhere/cursor.json" "$home/state/gh-mention-cursor.json"
+  out=$(run_plane "$home" poll 2>&1)
+  assert_equals 0 "$(records_in "$home")" "a spend that cannot be made durable accepts nothing"
+  assert_equals 0 "$(wakes_in "$home")" "a refused spend queues no wake"
+  assert_contains "$out" "not accepted" "the refusal says the mention was not accepted"
+  assert_equals 0 "$(jq -r '(.grants.guest.spent_on // []) | length' "$home/elsewhere/cursor.json")" \
+    "a refused spend leaves the grant untouched"
+  pass "fm-gh-mention: a bound that cannot be durably spent refuses the mention"
+}
+
+test_a_malformed_grant_is_refused() {
+  local home out
+  home=$(make_home badgrant '{"enabled":true,"trusted_logins":[{"login":"guest","until":"whenever"}]}')
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" 'not an ISO 8601 timestamp' "an unreadable expiry stops the plane"
+  home=$(make_home badcount '{"enabled":true,"trusted_logins":[{"login":"guest","remaining":-2}]}')
+  out=$(run_plane "$home" poll 2>&1)
+  assert_contains "$out" 'not a whole number of requests' "an unreadable count stops the plane"
+  pass "fm-gh-mention: a malformed bound stops the plane instead of being ignored"
+}
+
+test_the_plane_requests_a_fast_watcher_cadence() {
+  local home
+  home=$(make_home cadence "$DEFAULT_CONFIG")
+  assert_equals 30 "$(run_plane "$home" cadence)" "an enabled plane asks for the default fast cadence"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"repos":["owner/demo"],"check_interval":90}' \
+    > "$home/config/gh-mentions.json"
+  assert_equals 90 "$(run_plane "$home" cadence)" "a configured interval is what the plane asks for"
+  assert_contains "$(run_plane "$home" status)" "requested watcher interval: 90s" \
+    "status reports the interval this plane asks for"
+  printf '%s\n' '{"enabled":false,"trusted_logins":["mengsig"],"repos":["owner/demo"]}' \
+    > "$home/config/gh-mentions.json"
+  assert_equals '' "$(run_plane "$home" cadence)" "a disabled plane asks for no speed-up"
+  printf '%s\n' '{"enabled":true,"trusted_logins":["mengsig"],"check_interval":5}' \
+    > "$home/config/gh-mentions.json"
+  assert_contains "$(run_plane "$home" poll 2>&1)" 'from 10 to 300' \
+    "an out-of-range interval stops the plane rather than being clamped"
+  pass "fm-gh-mention: the plane requests a configured fast watcher cadence"
+}
+
 test_a_full_page_stops_the_cursor_where_the_read_stopped() {
   local home page cursor
   home=$(make_home paged '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
@@ -432,5 +601,14 @@ test_an_empty_watched_set_says_there_is_nothing_to_watch
 test_arm_binds_the_shim_and_disarm_removes_it
 test_a_disabled_config_arms_nothing
 test_review_comments_and_bodies_qualify_too
+test_a_plain_login_entry_is_a_permanent_authorization
+test_an_expiry_in_the_past_never_qualifies
+test_a_count_bounded_grant_stops_at_zero
+test_the_count_decrements_only_on_acceptance
+test_a_lapsed_grant_is_reported_once
+test_a_retried_mention_is_never_charged_twice
+test_an_unspendable_bound_refuses_the_mention
+test_a_malformed_grant_is_refused
+test_the_plane_requests_a_fast_watcher_cadence
 test_a_full_page_stops_the_cursor_where_the_read_stopped
 test_a_failed_read_keeps_the_repo_cursor

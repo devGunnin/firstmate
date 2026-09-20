@@ -7,6 +7,7 @@
 #   fm-gh-mention.sh pending          print the accepted-but-unhandled records as JSON
 #   fm-gh-mention.sh ack <record-id>  move one handled record into gh-mention-inbox/handled/
 #   fm-gh-mention.sh status           local-only summary: config, watched repos, cursors, pending count
+#   fm-gh-mention.sh cadence          print the watcher interval this plane asks for, or nothing
 #   fm-gh-mention.sh arm              write and register state/gh-mention.check.sh
 #   fm-gh-mention.sh disarm           remove the check shim and its trust binding
 #   fm-gh-mention.sh --help           print this help
@@ -61,6 +62,15 @@
 # before the drain does not queue it twice. The record is written BEFORE the
 # wake and the processed-id list is extended AFTER it, so a crash can duplicate
 # a wake but can never consume a pending record.
+#
+# RESPONSE LATENCY. An enabled plane asks the home's watcher for a sweep every
+# `check_interval` seconds (default 30) instead of the default 300, so a tagged
+# comment is picked up in tens of seconds. That request goes through the one
+# cadence config/x-mode.env that bin/fm-bootstrap.sh already owns for Relay: a
+# home running both planes gets one interval, the fastest either asked for,
+# never two. A tight cadence is affordable because the per-poll cost is fixed at
+# three reads per repo; it is still 3 x repos reads every interval, so a large
+# watched set is what a longer `check_interval` is for.
 #
 # Environment:
 #   FM_GH_MENTION_BUDGET    seconds one poll may spend on forge reads
@@ -134,6 +144,7 @@ config_load() {
   CFG_TRUSTED_JSON='[]'
   CFG_MARKERS_JSON='[]'
   CFG_MAY_OPEN_PR=false
+  CFG_INTERVAL=
   [ -e "$CONFIG" ] || return 1
   if [ -L "$CONFIG" ] || [ ! -f "$CONFIG" ] || [ ! -r "$CONFIG" ]; then
     CONFIG_PROBLEM='config/gh-mentions.json is not a readable regular file'
@@ -156,13 +167,13 @@ config_load() {
   esac
   CFG_ENABLED=$(printf '%s\n' "$parsed" | sed -n '1p')
   CFG_MAY_OPEN_PR=$(printf '%s\n' "$parsed" | sed -n '2p')
+  CFG_INTERVAL=$(printf '%s\n' "$parsed" | sed -n '3p')
   CFG_TRUSTED=$(printf '%s\n' "$parsed" | sed -n '/^--trusted$/,/^--markers$/p' | sed '1d;$d')
   CFG_MARKERS=$(printf '%s\n' "$parsed" | sed -n '/^--markers$/,/^--repos$/p' | sed '1d;$d')
   CFG_REPOS=$(printf '%s\n' "$parsed" | sed -n '/^--repos$/,$p' | sed '1d')
   # The forms the selection filter consumes, built once here rather than once
-  # per watched repository.
-  CFG_TRUSTED_JSON=$(printf '%s\n' "$CFG_TRUSTED" \
-    | jq -Rsc 'split("\n") | map(select(length > 0) | ascii_downcase)') || return 2
+  # per watched repository. CFG_TRUSTED is one compact grant object per line.
+  CFG_TRUSTED_JSON=$(printf '%s\n' "$CFG_TRUSTED" | jq -sc '.') || return 2
   CFG_MARKERS_JSON=$(printf '%s\n' "$CFG_MARKERS" \
     | jq -Rsc 'split("\n") | map(select(length > 0))') || return 2
   return 0
@@ -232,12 +243,14 @@ unwatched_projects() {
 
 cursor_read() {
   if [ -f "$CURSOR" ] && [ ! -L "$CURSOR" ] \
-    && jq -e --arg s "$CURSOR_SCHEMA" '.schema == $s and (.repos|type=="object") and (.processed|type=="array")' \
+    && jq -e --arg s "$CURSOR_SCHEMA" '.schema == $s and (.repos|type=="object")
+        and (.processed|type=="array")
+        and ((.grants // {}) | type == "object") and ((.lapsed // []) | type == "array")' \
       "$CURSOR" >/dev/null 2>&1; then
     cat "$CURSOR"
     return 0
   fi
-  jq -n --arg s "$CURSOR_SCHEMA" '{schema:$s,repos:{},processed:[]}'
+  jq -n --arg s "$CURSOR_SCHEMA" '{schema:$s,repos:{},processed:[],grants:{},lapsed:[]}'
 }
 
 cursor_write() {  # <cursor-json-file>
@@ -306,12 +319,128 @@ read_repo() {  # <owner/name> <since-iso> <candidates-out> <cursor-bound-out>
       + ($i[0] | norm("body"; "issue-")))[]' > "$out"
 }
 
+# ---------------------------------------------------------------- grants
+
+# An authorization may be permanent or bounded. A bounded grant ends at its
+# `until` time, after `remaining` accepted mentions, or at whichever of the two
+# comes first. The configured count is the captain's; what this home has already
+# spent lives in the cursor, so the plane never rewrites the captain's file and
+# an entry is never deleted when it lapses.
+#
+# Prints the logins that are live right now, lowercased, one per line.
+grants_live() {  # <cursor-json> <now-iso>
+  jq -r --slurpfile c "$1" --arg now "$2" --argjson trusted "$CFG_TRUSTED_JSON" '
+    ($now | fromdateiso8601) as $t
+    | ($c[0].grants // {}) as $spent
+    | $trusted[]
+    | (.login | ascii_downcase) as $id
+    | select((.until == null) or ((.until | fromdateiso8601) > $t))
+    | select((.remaining == null)
+        or (.remaining - (($spent[$id].spent_on // []) | length) > 0))
+    | $id' "$1" 2>/dev/null
+}
+
+# The bounded grants that have ended and have not been reported yet, so a
+# captain who stops being able to tag learns why once instead of guessing.
+grants_lapsed_unreported() {  # <cursor-json> <now-iso>
+  jq -r --slurpfile c "$1" --arg now "$2" --argjson trusted "$CFG_TRUSTED_JSON" '
+    ($now | fromdateiso8601) as $t
+    | ($c[0].grants // {}) as $spent
+    | ($c[0].lapsed // []) as $reported
+    | $trusted[]
+    | select(.until != null or .remaining != null)
+    | (.login | ascii_downcase) as $id
+    | select(($reported | index($id)) == null)
+    | select(((.until != null) and ((.until | fromdateiso8601) <= $t))
+        or ((.remaining != null) and (.remaining - (($spent[$id].spent_on // []) | length) <= 0)))
+    | $id + "\t" + (if (.until != null) and ((.until | fromdateiso8601) <= $t)
+        then "its authorization expired at " + .until
+        else "it used all " + (.remaining | tostring) + " of its authorized requests" end)' \
+    "$1" 2>/dev/null
+}
+
+# One readable line per authorization, with its bound and whether it is still
+# live, so the operator can see at a glance why an account can or cannot tag.
+grants_describe() {  # <cursor-json> <now-iso>
+  jq -r --slurpfile c "$1" --arg now "$2" --argjson trusted "$CFG_TRUSTED_JSON" '
+    ($now | fromdateiso8601) as $t
+    | ($c[0].grants // {}) as $spent
+    | $trusted[]
+    | (.login | ascii_downcase) as $id
+    | (($spent[$id].spent_on // []) | length) as $used
+    | ((.until != null) and ((.until | fromdateiso8601) <= $t)) as $expired
+    | ((.remaining != null) and (.remaining - $used <= 0)) as $exhausted
+    | .login
+      + (if .until == null and .remaining == null then " - permanent" else
+          " - " + ([(if .until != null then "until " + .until else empty end),
+                    (if .remaining != null then
+                       ((.remaining - $used | if . < 0 then 0 else . end) | tostring)
+                       + " of " + (.remaining | tostring) + " requests left"
+                     else empty end)] | join(", "))
+        end)
+      + (if $expired or $exhausted then " (LAPSED)" else "" end)' "$1" 2>/dev/null
+}
+
+# Report each bounded authorization that has ended and has not been reported
+# yet, then remember it, so a captain whose tagging stopped working learns why
+# once instead of guessing. The entry is never deleted and never auto-renewed.
+grants_report_lapsed() {  # <cursor-json> <now-iso>
+  local id why
+  while IFS=$'\t' read -r id why; do
+    [ -n "$id" ] || continue
+    say "the bounded authorization for $id has lapsed because $why; it no longer qualifies until the captain renews it"
+    jq --arg id "$id" '.lapsed = (((.lapsed // []) + [$id]) | unique)' "$1" > "$TMP/lapsed.json" \
+      && mv -f -- "$TMP/lapsed.json" "$1"
+  done < <(grants_lapsed_unreported "$1" "$2")
+}
+
+# Charge one accepted mention to a bounded grant, and persist that charge
+# before the mention is accepted. Returns 0 when the author may be acted on, 2
+# when the grant is not live, and 1 when the charge could not be made durable.
+#
+# The charge records WHICH mention it paid for, so it is idempotent: a poll that
+# crashed between charging and filing re-derives the same record id and charges
+# nothing further, and a grant with one request left can never fund two
+# mentions. What remains is the configured count minus the mentions already
+# funded, so the captain's own file is never rewritten.
+#
+# This fails closed on purpose: a count this home cannot read or durably record
+# must not authorize work, so an unwritable cursor refuses the mention rather
+# than accepting it on a bound nobody can verify. The poll holds this plane's
+# lock throughout, so no concurrent poll can charge the same grant at once.
+grant_charge() {  # <author-login> <record-id> <cursor-json> <now-iso>
+  local login=$1 record=$2 out=$3 now=$4 id state
+  id=$(printf '%s' "$login" | tr '[:upper:]' '[:lower:]')
+  state=$(jq -rn --arg id "$id" --arg rec "$record" --arg now "$now" --slurpfile c "$out" \
+    --argjson trusted "$CFG_TRUSTED_JSON" '
+    ($now | fromdateiso8601) as $t
+    | ($c[0].grants // {}) as $spent
+    | (($spent[$id].spent_on // [])) as $funded
+    | ([$trusted[] | select((.login | ascii_downcase) == $id)] | first)
+    | if . == null then "absent"
+      elif (.until != null) and ((.until | fromdateiso8601) <= $t) then "lapsed"
+      elif .remaining == null then "permanent"
+      elif ($funded | index($rec)) != null then "already-charged"
+      elif (.remaining - ($funded | length)) <= 0 then "lapsed"
+      else "bounded" end') || return 1
+  case "$state" in
+    permanent|already-charged) return 0 ;;
+    bounded) ;;
+    *) return 2 ;;
+  esac
+  jq --arg id "$id" --arg rec "$record" \
+    '.grants[$id].spent_on = (((.grants[$id].spent_on) // []) + [$rec] | unique)' "$out" \
+    > "$TMP/charge.json" || return 1
+  mv -f -- "$TMP/charge.json" "$out" || return 1
+  cursor_write "$out"
+}
+
 # ---------------------------------------------------------------- selection
 
 # The safety core, stated once and declaratively: a candidate survives only when
 # its own author is trusted AND its own body carries a configured marker.
 qualify() {  # <candidates-in> <repo> <qualified-out>
-  jq -c --arg repo "$2" --argjson trusted "$CFG_TRUSTED_JSON" \
+  jq -c --arg repo "$2" --argjson trusted "$LIVE_LOGINS_JSON" \
     --argjson markers "$CFG_MARKERS_JSON" --argjson cap "$BODY_MAX" '
     . as $c
     | ($c.author | ascii_downcase) as $login
@@ -393,7 +522,7 @@ resolve_budget() {
 # after every read for that repo succeeded, so a bounded or failed read costs a
 # repeat rather than a missed mention.
 poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
-  local repo=$1 state_json=$2 start=$3 out=$4 since line id advance
+  local repo=$1 state_json=$2 start=$3 out=$4 since line id advance charge
   since=$(jq -r --arg r "$repo" --arg b "$BACKFILL_SINCE" '.repos[$r] // $b' "$state_json")
   cp "$state_json" "$out" || return 1
   if ! read_repo "$repo" "$since" "$TMP/candidates.jsonl" "$TMP/bound"; then
@@ -414,6 +543,14 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
     id=$(jq -r '.record_id' "$TMP/one.json") || continue
     fm_pr_task_id_valid "$id" || continue
     [ ! -e "$INBOX/handled/$id.json" ] || continue
+    grant_charge "$(jq -r '.author' "$TMP/one.json")" "$id" "$out" "$start"
+    charge=$?
+    case "$charge" in
+      0) ;;
+      2) continue ;;
+      *) say "could not durably record a bounded authorization being spent; this mention is not accepted"
+         continue ;;
+    esac
     if accept "$TMP/one.json" "$id" "$start"; then
       say "$(jq -r '"\(.author) tagged \(.marker) on \(.subject_url)"' "$TMP/one.json") (record $id)"
       jq --arg id "$id" --argjson keep "$KEEP" \
@@ -458,6 +595,16 @@ action_poll() {
   DEADLINE=$(( $(date +%s) + BUDGET ))
   state_json="$TMP/cursor.json"
   cursor_read > "$state_json"
+  grants_report_lapsed "$state_json" "$start"
+  LIVE_LOGINS_JSON=$(grants_live "$state_json" "$start" \
+    | jq -Rsc 'split("\n") | map(select(length > 0))') || LIVE_LOGINS_JSON=
+  if [ -z "$LIVE_LOGINS_JSON" ]; then
+    say 'could not read which authorizations are still live; no mention is accepted this cycle'
+    return 0
+  fi
+  # A renewed grant becomes reportable again the next time it lapses.
+  jq --argjson live "$LIVE_LOGINS_JSON" '.lapsed = (((.lapsed // []) - $live))' "$state_json" \
+    > "$TMP/relive.json" && mv -f -- "$TMP/relive.json" "$state_json"
   next="$TMP/cursor-next.json"
   while IFS= read -r repo; do
     [ -n "$repo" ] || continue
@@ -514,14 +661,19 @@ action_ack() {  # <record-id>
 action_status() {
   local rc=0 repos pending=0
   config_load || rc=$?
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-gh-mention.XXXXXX") || die 'no scratch directory'
+  TMP_STATUS="$TMP/cursor.json"
   case "$rc" in
     1) printf 'gh mentions: off (no config/gh-mentions.json)\n'; return 0 ;;
     2) printf 'gh mentions: stopped - %s\n' "$CONFIG_PROBLEM"; return 1 ;;
   esac
   printf 'gh mentions: %s\n' "$([ "$CFG_ENABLED" = true ] && echo on || echo 'off (enabled=false)')"
-  printf 'trusted logins: %s\n' "$(printf '%s\n' "$CFG_TRUSTED" | paste -sd, -)"
+  printf 'authorized logins:\n'
+  cursor_read > "$TMP_STATUS"
+  grants_describe "$TMP_STATUS" "$(now_iso)" | sed 's/^/  /'
   printf 'markers: %s\n' "$(printf '%s\n' "$CFG_MARKERS" | paste -sd, -)"
   printf 'may open pr: %s\n' "$CFG_MAY_OPEN_PR"
+  printf 'requested watcher interval: %ss\n' "$CFG_INTERVAL"
   unwatched_projects | sed 's/^/unwatched: /'
   repos=$(watched_repos)
   if [ -z "$repos" ]; then
@@ -535,6 +687,18 @@ action_status() {
   fi
   printf 'pending mentions: %s\n' "$pending"
   printf 'armed: %s\n' "$(fm_custom_check_registered "$STATE" "$CHECK_ID" && echo yes || echo no)"
+}
+
+# The cadence this plane asks the home's watcher for, or nothing when it is off.
+# bin/fm-bootstrap.sh owns config/x-mode.env and reconciles this request with
+# Relay's; this plane never writes a cadence or runs a timer of its own.
+action_cadence() {
+  local rc=0
+  config_load || rc=$?
+  [ "$rc" -eq 0 ] || return 0
+  [ "$CFG_ENABLED" = true ] || return 0
+  [ -n "$(watched_repos)" ] || return 0
+  printf '%s\n' "$CFG_INTERVAL"
 }
 
 action_arm() {
@@ -570,6 +734,7 @@ case "${1:-check}" in
   pending) action_pending ;;
   ack) shift; action_ack "$@" ;;
   status) action_status ;;
+  cadence) action_cadence ;;
   arm) action_arm ;;
   disarm) action_disarm ;;
   -h|--help) usage ;;

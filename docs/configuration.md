@@ -645,14 +645,19 @@ This section is the single owner of the configuration schema and the generated s
 ```json
 {
   "enabled": true,
-  "trusted_logins": ["devGunnin", "mengsig"],
+  "trusted_logins": [
+    "devGunnin",
+    "mengsig",
+    {"login": "a-collaborator", "until": "2026-10-01T00:00:00Z", "remaining": 5}
+  ],
   "markers": ["@firstmate", "@captain"],
   "repos": ["owner/name"],
-  "may_open_pr": true
+  "may_open_pr": true,
+  "check_interval": 30
 }
 ```
 
-`enabled` and `trusted_logins` are required; `markers` defaults to `@firstmate` and `@captain`, `repos` defaults to empty, and `may_open_pr` defaults to `false`.
+`enabled` and `trusted_logins` are required; `markers` defaults to `@firstmate` and `@captain`, `repos` defaults to empty, `may_open_pr` defaults to `false`, and `check_interval` defaults to 30.
 A malformed or unreadable file, including an unknown key, stops the plane with an actionable error rather than falling back on a default.
 That strictness is deliberate: a typo in `trusted_logins` would otherwise silently widen or narrow who firstmate obeys.
 
@@ -666,7 +671,22 @@ A comment or body qualifies only when both conditions hold on that same body: it
 The marker is what separates a request meant for firstmate from ordinary conversation by a trusted account; without it, every comment a trusted collaborator writes would start work.
 Because only the body's own author is checked, a marker quoted from someone else never qualifies on its own.
 Everything that does not qualify is ignored silently: no record, no wake, and no write to GitHub.
-Authorizing a collaborator is exactly adding their login to `trusted_logins`, and every listed login carries the same authority; per-account authority tiers do not exist.
+Authorizing a collaborator is exactly adding their login to `trusted_logins`, and every listed login carries the same authority.
+A bound limits how long or how often an account may ask, never what it may ask for, so per-account authority tiers do not exist.
+
+**An authorization can be bounded rather than permanent.**
+A `trusted_logins` entry is either a plain login string, which authorizes that account until the captain removes it, or an object carrying that login plus `until`, `remaining`, or both.
+`until` is an ISO 8601 timestamp the grant expires at; `remaining` is how many accepted mentions it funds.
+With both present the grant ends at whichever bound is reached first.
+This is what lets an outside account be trialled for a few requests or a short window without becoming a standing authorization, and it lapses on its own rather than depending on anyone remembering to remove it.
+
+The count spends once per **accepted** mention from that account, never per poll, per comment scanned, or per action taken afterwards.
+What has been spent lives in `state/gh-mention-cursor.json`, so the plane never rewrites the captain's configuration and never deletes a lapsed entry.
+Spending fails closed: the charge is made durable before the mention is accepted, so a count this home cannot read or record refuses the mention rather than acting on a bound nobody can verify.
+The poll holds this plane's lock throughout, so no two polls can spend the same unit, and a charge records which mention it paid for, so a poll that crashed between charging and filing re-derives the same mention and charges nothing further.
+A grant that has expired or run out stops qualifying immediately and is reported once, so tagging that stopped working is visible instead of silently confusing; raising `remaining` or extending `until` makes it live again, and it becomes reportable again the next time it lapses.
+`bin/fm-gh-mention.sh status` prints each authorization with its bound and whether it is still live.
+A bounded grant is defense in depth on top of the rules below, never a replacement for them.
 
 A trusted tag is consent for reversible work - replying, investigating, dispatching, pushing a fix branch, and opening a pull request when `may_open_pr` is true.
 Merging, closing, deleting, force-pushing, credential changes, and anything else irreversible or security-sensitive still require the captain's explicit word, the same boundary the Relay public-mention path holds.
@@ -685,6 +705,11 @@ Generated state, all under `state/` and gitignored:
 
 Each accepted mention appends exactly one durable `check: gh-mention <record-id>` wake.
 A crash can duplicate that wake but can never consume the pending record, so a mention is never lost.
+
+**Response latency.**
+An enabled plane asks this home's watcher to sweep every `check_interval` seconds (default 30, valid 10 to 300) instead of the default 300, so a tagged comment is picked up in tens of seconds.
+That request goes through the one cadence file `config/x-mode.env`, whose contract "Watcher cadence" above owns: a home running both this plane and Relay ends up with a single interval, the fastest either asked for, and neither plane runs a timer or a poll loop of its own.
+A tight cadence is affordable because the per-poll cost is fixed at three reads per repository, but it is still three reads per repository every interval: a large watched set is what a longer `check_interval` is for, since GitHub's authenticated hourly allowance is shared with everything else this host does.
 
 Session start keeps the poll armed exactly while the configuration says it should be, and reports anything that stops or limits it as a `GH_MENTIONS:` line; a configuration that is removed, disabled, or broken also retires the shim, so the watcher never polls a plane the captain turned off.
 Arming the check is itself a reason to watch, so the home keeps a watcher for it after the last task is torn down.
@@ -722,6 +747,23 @@ A fail-closed poll that already queued a wake, and a timeout, always print so th
 `FM_MAIL_CHECK_BUDGET` (default 15, valid 5..25) bounds one standing poll and is cut down to fit `FM_CHECK_TIMEOUT`.
 `bin/fm-mail-check.sh disarm` removes the standing check.
 
+## Watcher cadence (config/x-mode.env)
+
+`bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` once at process start and otherwise sweeps its checks every 300 seconds.
+Some planes need a faster sweep than that to be useful, so each one REQUESTS an interval at session start and the generated `config/x-mode.env` carries the single interval that results - the fastest any enabled plane asked for.
+This section is the single owner of that contract.
+There is one cadence, one file, and one writer; a plane never starts a timer, a second poll loop, or a competing interval of its own.
+
+The requesters today are Relay, which asks for 30 seconds whenever it is opted in, and the GitHub mention plane, which asks for its configured `check_interval` whenever it is enabled with something to watch.
+A home with neither enabled has no such file and keeps the default 300 seconds.
+A home with both gets one interval, so opting into the second plane never doubles a home's polling.
+
+The file is generated by the locked session-start bootstrap step, and the session-start supervision operating block includes the cadence instruction whenever it exists.
+The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
+Because the interval is read only at watcher start, a cadence transition - a plane opted in while a watcher is already running, or opted out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
+When no plane asks for a speed-up any more, the next locked session-start bootstrap step removes the file and the default cadence applies on the next supervision cycle.
+Steady-state off is silent and writes nothing.
+
 ## Relay (.env)
 
 Relay lets a firstmate instance answer public mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
@@ -745,13 +787,13 @@ To turn it on:
 The dashboard owns account creation, identity linking, bot installation, and token issuance; this document owns only what the local firstmate home does with the token once it is in `.env`.
 
 The locked session-start bootstrap step turns the token into local generated state.
-It writes `state/x-watch.check.sh`, a byte-static identity shim for `bin/fm-x-poll.sh`, and `config/x-mode.env`, which exports `FM_CHECK_INTERVAL=30` for watcher processes in that home.
+It writes `state/x-watch.check.sh`, a byte-static identity shim for `bin/fm-x-poll.sh`, and asks for a 30-second watcher cadence.
 The watcher accepts the shim only when its bytes match the expected generated content, then invokes the trusted repository poll script directly instead of executing state-file source.
-This section is the single owner of the Relay cadence contract: a Relay instance polls every 30 seconds instead of the default 300, only a Relay instance speeds up because a non-Relay home has no `config/x-mode.env`, and the session-start supervision operating block includes the cadence instruction when that file exists.
+Relay polls every 30 seconds instead of the default 300; "Watcher cadence" above owns how that request becomes the home's one interval.
 The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
 Because `bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` only at process start, a cadence transition - opt-in while a watcher is already running, or opt-out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
 While a legacy daemon flag is active the daemon owns the watcher and its default cadence applies; on Pi the away-posture record alone leaves the ordinary Relay watcher cadence active, and daemon-backed Relay cadence remains a deferred follow-up.
-When the token is removed or empty, the next locked session-start bootstrap step removes those artifacts.
+When the token is removed or empty, the next locked session-start bootstrap step removes Relay's own shim.
 Steady-state off is silent and writes nothing.
 Relay remains additive to non-Relay lifecycle behavior: homes without the generated artifacts keep the default watcher cadence and do not run the Relay poll.
 Its request handling remains in Relay-specific `bin/` scripts and the `fmx-respond` skill, while the watcher owns authenticated dispatch from the generated local identity shim.
