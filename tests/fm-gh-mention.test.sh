@@ -8,7 +8,7 @@
 #
 # The fake `gh` serves one canned listing per repository and endpoint from
 # $FM_TEST_GH_DIR and records the API paths it was asked for, which is how the
-# "never reads an unwatched repo" and "three reads per repo" properties are
+# "never reads an unwatched repo" and one-page baseline-cost properties are
 # asserted through the interface rather than by inspecting internals.
 set -u
 
@@ -45,6 +45,9 @@ fi
 [ -f "$FM_TEST_GH_DIR/fail" ] && exit 1
 page=$(printf '%s\n' "$query" | tr '&' '\n' | sed -n 's/^page=//p')
 page=${page:-1}
+if [ -f "$FM_TEST_GH_DIR/$repo.$kind.fail-page-$page" ]; then
+  exit 1
+fi
 if [ -f "$FM_TEST_GH_DIR/$repo.$kind.page-$page.json" ]; then
   cat "$FM_TEST_GH_DIR/$repo.$kind.page-$page.json"
 elif [ "$page" = 1 ] && [ -f "$FM_TEST_GH_DIR/$repo.$kind.json" ]; then
@@ -166,7 +169,7 @@ test_an_old_body_bumped_by_new_activity_is_not_a_new_mention() {
 # page overflows advances the cursor past a thread that was opened inside the
 # window but never read.
 test_a_newly_opened_body_cut_off_from_page_one_is_still_filed() {
-  local home page cursor bumped created
+  local home page bumped created
   home=$(make_home page-overflow '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
   bumped=$(iso_ago 600)
   created=$(iso_ago 1200)
@@ -177,19 +180,11 @@ test_a_newly_opened_body_cut_off_from_page_one_is_still_filed() {
      html_url:"https://github.com/o/busy/issues/\(800 + .)",
      created_at:$created,updated_at:$updated}]')
   canned_page "$home" o/busy issues 1 "$page"
-  run_plane "$home" poll >/dev/null 2>&1
-  cursor=$(jq -r '.repos["o/busy"]' "$home/state/gh-mention-cursor.json")
-  assert_equals "$bumped" "$cursor" \
-    "a full page leaves the cursor at the last entry it actually read"
-  assert_equals 0 "$(records_in "$home")" "nothing on that page was tagged"
-
-  # Issue #42 was opened inside the poll's backfill window but sat beyond page
-  # one, so its creation time is older than the cursor the overflow left behind.
   canned_page "$home" o/busy issues 2 \
-    "[$(comment 842 mengsig '@firstmate please take this' \
-      'https://github.com/o/busy/issues/42' "$created")]"
+    "[$(comment 942 mengsig '@firstmate please take this' \
+      'https://github.com/o/busy/issues/942' "$created")]"
   run_plane "$home" poll >/dev/null 2>&1
-  assert_present "$home/state/gh-mention-inbox/issue-842.json" \
+  assert_present "$home/state/gh-mention-inbox/issue-942.json" \
     "a thread opened inside the window must still be filed once the page no longer hides it"
   assert_equals 1 "$(wakes_in "$home")" "the recovered mention queues its wake"
   pass "fm-gh-mention: a newly opened body cut off from page one is still filed"
@@ -487,7 +482,7 @@ test_an_unwatched_repo_is_never_read() {
   pass "fm-gh-mention: a qualifying mention in an unwatched repository is never read"
 }
 
-test_every_watched_repo_makes_progress_at_a_constant_cost() {
+test_every_one_page_repo_makes_progress_at_the_baseline_cost() {
   local home out repo id=200
   home=$(make_home many \
     '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/one","o/two","o/three"]}')
@@ -502,11 +497,11 @@ test_every_watched_repo_makes_progress_at_a_constant_cost() {
   for repo in one two three; do
     assert_contains "$out" "https://github.com/o/$repo/issues/1" "the poll reports the mention in o/$repo"
     assert_equals 3 "$(grep -c "^repos/o/$repo/" "$home/gh/paths.log")" \
-      "o/$repo costs exactly three reads per poll"
+      "one-page o/$repo costs exactly three reads per poll"
   done
   assert_equals 3 "$(jq -r '.repos | length' "$home/state/gh-mention-cursor.json")" \
     "every watched repo carries its own cursor"
-  pass "fm-gh-mention: every watched repo makes progress at a constant three reads per poll"
+  pass "fm-gh-mention: every one-page repo makes progress at three baseline reads"
 }
 
 # The read cursors below are deliberately the reverse of the attempt clock, so
@@ -874,12 +869,11 @@ test_the_plane_requests_a_fast_watcher_cadence() {
   pass "fm-gh-mention: the plane requests a fixed fast watcher cadence"
 }
 
-test_a_full_page_stops_the_cursor_where_the_read_stopped() {
+test_a_full_listing_is_exhausted_before_the_cursor_advances() {
   local home page cursor
   home=$(make_home paged '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
-  # A repo with more new activity than one page holds: the listing comes back
-  # full, so the cursor must stop at the last moment actually read instead of
-  # jumping to now and stepping over everything the page cut off.
+  # A repo with exactly one full page must read the following page before its
+  # cursor advances.
   page=$(jq -nc '[range(100) | {id:(500 + .),user:{login:"mengsig"},
     body:"@firstmate item \(.)",
     html_url:"https://github.com/o/busy/issues/1#issuecomment-\(500 + .)",
@@ -887,12 +881,14 @@ test_a_full_page_stops_the_cursor_where_the_read_stopped() {
   canned "$home" o/busy comments "$page"
   run_plane "$home" poll >/dev/null 2>&1
   cursor=$(jq -r '.repos["o/busy"]' "$home/state/gh-mention-cursor.json")
-  assert_equals '2026-09-19T09:00:00Z' "$cursor" \
-    "a full page leaves the cursor at the last entry it actually read"
-  pass "fm-gh-mention: a full listing page stops the cursor where the read stopped"
+  assert_equals "$cursor" "$(jq -r '.listings["o/busy"].comments.since' \
+    "$home/state/gh-mention-cursor.json")" "a completed listing advances its timestamp cursor"
+  assert_equals 2 "$(grep -c '^repos/o/busy/issues/comments$' "$home/gh/paths.log")" \
+    "a full first page is followed through its empty second page"
+  pass "fm-gh-mention: a full listing is exhausted before its cursor advances"
 }
 
-test_a_full_page_timestamp_tie_continues_on_the_next_page() {
+test_a_full_page_timestamp_tie_is_exhausted_in_one_poll() {
   local home page tagged
   home=$(make_home page-tie '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
   page=$(jq -nc '[range(100) | {id:(600 + .),user:{login:"someone-else"},body:"routine",
@@ -905,14 +901,48 @@ test_a_full_page_timestamp_tie_continues_on_the_next_page() {
   canned_page "$home" o/busy comments 2 "$tagged"
 
   run_plane "$home" poll >/dev/null 2>&1
-  assert_equals 2 "$(jq -r '.listings["o/busy"].comments.page' "$home/state/gh-mention-cursor.json")" \
-    "a full page preserves the next page position"
-  run_plane "$home" poll >/dev/null 2>&1
 
   assert_present "$home/state/gh-mention-inbox/comment-700.json" \
     "the tagged item after 100 identical timestamps is eventually filed"
   assert_equals 1 "$(wakes_in "$home")" "the tied item queues exactly one wake"
-  pass "fm-gh-mention: a full-page timestamp tie continues on page two"
+  assert_equals null "$(jq -r '.listings["o/busy"].comments.page // "null"' \
+    "$home/state/gh-mention-cursor.json")" "no numeric page position survives the poll"
+  pass "fm-gh-mention: a full-page timestamp tie is exhausted in one poll"
+}
+
+test_a_reordered_listing_restarts_before_advancing() {
+  local home first shifted tail tagged
+  home=$(make_home reordered '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
+  first=$(jq -nc '[range(100) | {id:(800 + .),user:{login:"someone-else"},body:"routine",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-\(800 + .)",
+    updated_at:"2026-09-19T09:00:00Z"}]')
+  tagged=$(jq -nc '{id:900,user:{login:"mengsig"},body:"@firstmate shifted request",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-900",
+    updated_at:"2026-09-19T09:00:00Z"}')
+  canned_page "$home" o/busy comments 1 "$first"
+  canned_page "$home" o/busy comments 2 "[$tagged]"
+  : > "$home/gh/o__busy.comments.fail-page-2"
+
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals '' "$(jq -r '.repos["o/busy"] // ""' "$home/state/gh-mention-cursor.json")" \
+    "an interrupted traversal does not advance the read cursor"
+
+  shifted=$(jq -nc --argjson tagged "$tagged" '[range(1;100) | {id:(800 + .),
+    user:{login:"someone-else"},body:"routine",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-\(800 + .)",
+    updated_at:"2026-09-19T09:00:00Z"}] + [$tagged]')
+  tail=$(jq -nc '[{id:800,user:{login:"someone-else"},body:"edited",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-800",
+    updated_at:"2026-09-20T09:00:00Z"}]')
+  canned_page "$home" o/busy comments 1 "$shifted"
+  canned_page "$home" o/busy comments 2 "$tail"
+  rm "$home/gh/o__busy.comments.fail-page-2"
+  run_plane "$home" poll >/dev/null 2>&1
+
+  assert_present "$home/state/gh-mention-inbox/comment-900.json" \
+    "a tagged item shifted onto page one is filed after the traversal restarts"
+  assert_equals 1 "$(wakes_in "$home")" "the shifted request queues exactly one wake"
+  pass "fm-gh-mention: a reordered listing restarts before cursor advancement"
 }
 
 test_a_failed_read_keeps_the_repo_cursor() {
@@ -1095,7 +1125,7 @@ test_a_quoted_marker_never_qualifies_on_its_own
 test_a_repeated_poll_does_not_duplicate_the_record
 test_ack_moves_the_record_into_handled
 test_an_unwatched_repo_is_never_read
-test_every_watched_repo_makes_progress_at_a_constant_cost
+test_every_one_page_repo_makes_progress_at_the_baseline_cost
 test_the_least_recently_attempted_repo_goes_first
 test_a_registered_project_contributes_its_github_origin
 test_an_unresolvable_project_is_reported_not_dropped
@@ -1114,8 +1144,9 @@ test_an_unspendable_bound_refuses_the_mention
 test_a_lapse_that_cannot_be_recorded_is_never_announced
 test_a_malformed_grant_is_refused
 test_the_plane_requests_a_fast_watcher_cadence
-test_a_full_page_stops_the_cursor_where_the_read_stopped
-test_a_full_page_timestamp_tie_continues_on_the_next_page
+test_a_full_listing_is_exhausted_before_the_cursor_advances
+test_a_full_page_timestamp_tie_is_exhausted_in_one_poll
+test_a_reordered_listing_restarts_before_advancing
 test_a_failed_read_keeps_the_repo_cursor
 test_a_persistent_failure_is_reported_once
 test_a_standing_failure_survives_the_sweep_rotation
