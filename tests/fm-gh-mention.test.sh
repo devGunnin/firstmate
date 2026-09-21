@@ -25,6 +25,7 @@ cat > "$FAKEBIN/gh" <<'FAKE'
 # Fake gh for the mention plane's tests: canned listings plus a request log.
 for arg in "$@"; do last=$arg; done
 path=${last%%\?*}
+query=${last#*\?}
 printf '%s\n' "$path" >> "$FM_TEST_GH_DIR/paths.log"
 case "$path" in
   */issues/comments) kind=comments ;;
@@ -42,7 +43,11 @@ if [ -f "$FM_TEST_GH_DIR/ratelimit" ]; then
   exit 1
 fi
 [ -f "$FM_TEST_GH_DIR/fail" ] && exit 1
-if [ -f "$FM_TEST_GH_DIR/$repo.$kind.json" ]; then
+page=$(printf '%s\n' "$query" | tr '&' '\n' | sed -n 's/^page=//p')
+page=${page:-1}
+if [ -f "$FM_TEST_GH_DIR/$repo.$kind.page-$page.json" ]; then
+  cat "$FM_TEST_GH_DIR/$repo.$kind.page-$page.json"
+elif [ "$page" = 1 ] && [ -f "$FM_TEST_GH_DIR/$repo.$kind.json" ]; then
   cat "$FM_TEST_GH_DIR/$repo.$kind.json"
 else
   printf '[]\n'
@@ -63,6 +68,11 @@ make_home() {
 canned() {
   local home=$1 repo=$2 kind=$3 json=$4
   printf '%s\n' "$json" > "$home/gh/${repo%/*}__${repo#*/}.$kind.json"
+}
+
+canned_page() {
+  local home=$1 repo=$2 kind=$3 page=$4 json=$5
+  printf '%s\n' "$json" > "$home/gh/${repo%/*}__${repo#*/}.$kind.page-$page.json"
 }
 
 # comment <id> <login> <body> <html-url> [created-at]: one listing entry in
@@ -166,7 +176,7 @@ test_a_newly_opened_body_cut_off_from_page_one_is_still_filed() {
     {id:(800 + .),user:{login:"someone-else"},body:"routine \(.)",
      html_url:"https://github.com/o/busy/issues/\(800 + .)",
      created_at:$created,updated_at:$updated}]')
-  canned "$home" o/busy issues "$page"
+  canned_page "$home" o/busy issues 1 "$page"
   run_plane "$home" poll >/dev/null 2>&1
   cursor=$(jq -r '.repos["o/busy"]' "$home/state/gh-mention-cursor.json")
   assert_equals "$bumped" "$cursor" \
@@ -175,7 +185,7 @@ test_a_newly_opened_body_cut_off_from_page_one_is_still_filed() {
 
   # Issue #42 was opened inside the poll's backfill window but sat beyond page
   # one, so its creation time is older than the cursor the overflow left behind.
-  canned "$home" o/busy issues \
+  canned_page "$home" o/busy issues 2 \
     "[$(comment 842 mengsig '@firstmate please take this' \
       'https://github.com/o/busy/issues/42' "$created")]"
   run_plane "$home" poll >/dev/null 2>&1
@@ -770,6 +780,26 @@ test_a_retried_mention_is_never_charged_twice() {
   pass "fm-gh-mention: a retried mention is never charged to a grant twice"
 }
 
+test_an_expired_grant_finishes_an_already_charged_mention() {
+  local home
+  home=$(make_home charged-expired \
+    '{"enabled":true,"trusted_logins":[{"login":"guest","until":"2020-01-01T00:00:00Z","remaining":1}],"repos":["o/r"]}')
+  canned "$home" o/r comments \
+    "[$(comment 451 guest '@firstmate finish this' 'https://github.com/o/r/issues/1#issuecomment-451')]"
+  jq -n '{schema:"fm-gh-mention-cursor.v1",repos:{},listings:{},processed:[],
+    grants:{guest:{spent_on:["comment-451"]}},lapsed:[],attempted:{}}' \
+    > "$home/state/gh-mention-cursor.json"
+
+  run_plane "$home" poll >/dev/null 2>&1
+
+  assert_present "$home/state/gh-mention-inbox/comment-451.json" \
+    "a charged mention is filed even after its grant expires"
+  assert_equals 1 "$(wakes_in "$home")" "the interrupted acceptance finishes its durable wake"
+  assert_equals 1 "$(jq -r '.grants.guest.spent_on | length' "$home/state/gh-mention-cursor.json")" \
+    "finishing the retry does not spend the expired grant again"
+  pass "fm-gh-mention: an expired grant finishes an already charged mention"
+}
+
 # The lapse line is news, so nothing suppresses a repeat of it. That makes its
 # report-once state load-bearing: an announcement this home cannot remember
 # would print on every poll, and every printed line is another wake.
@@ -860,6 +890,29 @@ test_a_full_page_stops_the_cursor_where_the_read_stopped() {
   assert_equals '2026-09-19T09:00:00Z' "$cursor" \
     "a full page leaves the cursor at the last entry it actually read"
   pass "fm-gh-mention: a full listing page stops the cursor where the read stopped"
+}
+
+test_a_full_page_timestamp_tie_continues_on_the_next_page() {
+  local home page tagged
+  home=$(make_home page-tie '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
+  page=$(jq -nc '[range(100) | {id:(600 + .),user:{login:"someone-else"},body:"routine",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-\(600 + .)",
+    updated_at:"2026-09-19T09:00:00Z"}]')
+  tagged=$(jq -nc '[{id:700,user:{login:"mengsig"},body:"@firstmate do not lose this",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-700",
+    updated_at:"2026-09-19T09:00:00Z"}]')
+  canned_page "$home" o/busy comments 1 "$page"
+  canned_page "$home" o/busy comments 2 "$tagged"
+
+  run_plane "$home" poll >/dev/null 2>&1
+  assert_equals 2 "$(jq -r '.listings["o/busy"].comments.page' "$home/state/gh-mention-cursor.json")" \
+    "a full page preserves the next page position"
+  run_plane "$home" poll >/dev/null 2>&1
+
+  assert_present "$home/state/gh-mention-inbox/comment-700.json" \
+    "the tagged item after 100 identical timestamps is eventually filed"
+  assert_equals 1 "$(wakes_in "$home")" "the tied item queues exactly one wake"
+  pass "fm-gh-mention: a full-page timestamp tie continues on page two"
 }
 
 test_a_failed_read_keeps_the_repo_cursor() {
@@ -1056,11 +1109,13 @@ test_a_count_bounded_grant_stops_at_zero
 test_the_count_decrements_only_on_acceptance
 test_a_lapsed_grant_is_reported_once
 test_a_retried_mention_is_never_charged_twice
+test_an_expired_grant_finishes_an_already_charged_mention
 test_an_unspendable_bound_refuses_the_mention
 test_a_lapse_that_cannot_be_recorded_is_never_announced
 test_a_malformed_grant_is_refused
 test_the_plane_requests_a_fast_watcher_cadence
 test_a_full_page_stops_the_cursor_where_the_read_stopped
+test_a_full_page_timestamp_tie_continues_on_the_next_page
 test_a_failed_read_keeps_the_repo_cursor
 test_a_persistent_failure_is_reported_once
 test_a_standing_failure_survives_the_sweep_rotation

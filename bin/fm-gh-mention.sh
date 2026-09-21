@@ -39,13 +39,15 @@
 # Authorizing a collaborator is exactly adding their login to `trusted_logins`,
 # and every listed login carries the same authority.
 #
-# THE POLL PERFORMS NO FORGE WRITES AT ALL. It reads three repo-scoped listings
-# per repo per poll, each bounded by a `since` cursor so the cost is a small
-# constant per repo rather than growing with repo history:
+# THE POLL PERFORMS NO FORGE WRITES AT ALL. It reads one page from each of three
+# repo-scoped listings per repo per poll, each bounded by its own durable
+# `since` and page cursor so the cost is a small constant per repo per poll:
 #   repos/<o>/<r>/issues/comments  issue and PR conversation comments
 #   repos/<o>/<r>/pulls/comments   PR review comments
 #   repos/<o>/<r>/issues           bodies of threads OPENED in the window read
-# GitHub filters all three by `since` on updated_at, and a thread's updated_at
+# A full page advances only that listing's page cursor; later polls continue
+# through every tied timestamp before its `since` cursor advances. GitHub
+# filters all three by `since` on updated_at, and a thread's updated_at
 # moves on ANY activity - a new comment, a label, a reopen. For a comment that
 # is what is wanted, because only editing THAT comment moves its own stamp. For
 # a body it is not: an issue tagged months ago and bumped today would be filed
@@ -80,8 +82,8 @@
 # DURABLE STATE (all under state/, all gitignored):
 #   gh-mention-inbox/<record-id>.json          one accepted mention, pending
 #   gh-mention-inbox/handled/<record-id>.json  the same record after ack
-#   gh-mention-cursor.json                     per-repo since cursors, the
-#                                              per-repo attempt clock that
+#   gh-mention-cursor.json                     per-listing page/since cursors,
+#                                              the per-repo attempt clock that
 #                                              orders sweeps, and the bounded
 #                                              processed-id list
 #   gh-mention.reported                        one scope-keyed line per failure
@@ -397,13 +399,14 @@ cursor_read() {
         and (.processed|type=="array")
         and ((.grants // {}) | type == "object") and ((.lapsed // []) | type == "array")
         and ((.attempted // {}) | type == "object")
+        and ((.listings // {}) | type == "object")
         ' \
       "$CURSOR" >/dev/null 2>&1; then
     cat "$CURSOR"
     return 0
   fi
   jq -n --arg s "$CURSOR_SCHEMA" \
-    '{schema:$s,repos:{},processed:[],grants:{},lapsed:[],attempted:{}}'
+    '{schema:$s,repos:{},listings:{},processed:[],grants:{},lapsed:[],attempted:{}}'
 }
 
 cursor_write() {  # <cursor-json-file>
@@ -446,28 +449,43 @@ forge() {  # <api-path> <output-file>
   jq -e 'type == "array"' "$out" >/dev/null 2>&1
 }
 
-# The three repo-scoped listings, each bounded by the same `since` cursor and
-# normalized into one candidate stream: {record_id, comment_kind, comment_id,
-# comment_url, author, body}. Only these three calls per repo per poll.
-#
-# Each listing is asked for its oldest page first, so a repo with more new
-# activity than one page holds is read in order rather than sampled. A full page
-# means there is more behind it, so read_repo also reports the newest moment
-# this repo's cursor may advance to without stepping over what it did not read;
-# empty means every listing was read to its end.
-read_repo() {  # <owner/name> <since-iso> <candidates-out> <cursor-bound-out>
-  local repo=$1 since=$2 out=$3 bound=$4 q
-  q="per_page=$PER_PAGE&sort=updated&direction=asc&since=$since"
-  forge "repos/$repo/issues/comments?$q" "$TMP/comments.json" || return 1
-  forge "repos/$repo/pulls/comments?$q" "$TMP/review.json" || return 1
-  forge "repos/$repo/issues?state=all&$q" "$TMP/issues.json" || return 1
+# Each listing has its own durable page position. Keeping the original `since`
+# while a page is full is what makes page two reachable when more than 100
+# entries share the boundary timestamp.
+listing_position() {  # <cursor-json> <repo> <listing> <default-since>
+  jq -r --arg r "$2" --arg k "$3" --arg s "$4" '
+    [(.listings[$r][$k].since // $s), (.listings[$r][$k].page // 1)] | @tsv' "$1"
+}
+
+read_listing() {  # <repo> <listing> <api-path> <default-since> <cursor-json> <out>
+  local repo=$1 key=$2 api=$3 fallback=$4 state_json=$5 out=$6 since page q
+  IFS=$'\t' read -r since page < <(listing_position "$state_json" "$repo" "$key" "$fallback")
+  [ -n "$since" ] || return 1
+  case "$page" in ''|*[!0-9]*|0) return 1 ;; esac
+  q="per_page=$PER_PAGE&sort=updated&direction=asc&since=$since&page=$page"
+  [ "$key" != issues ] || q="state=all&$q"
+  forge "repos/$repo/$api?$q" "$out" || return 1
+  jq -n --arg k "$key" --arg s "$since" --argjson p "$page" \
+    --argjson full "$(jq --argjson n "$PER_PAGE" 'length >= $n' "$out")" \
+    '{key:$k,since:$s,page:$p,full:$full}' >> "$TMP/listing-pages.jsonl"
+}
+
+# Read one page from each listing and normalize them into one candidate stream.
+read_repo() {  # <owner/name> <since-iso> <cursor-json> <candidates-out> <cursor-bound-out>
+  local repo=$1 since=$2 state_json=$3 out=$4 bound=$5 issue_since
+  : > "$TMP/listing-pages.jsonl"
+  read_listing "$repo" comments issues/comments "$since" "$state_json" "$TMP/comments.json" || return 1
+  read_listing "$repo" review pulls/comments "$since" "$state_json" "$TMP/review.json" || return 1
+  read_listing "$repo" issues issues "$since" "$state_json" "$TMP/issues.json" || return 1
+  issue_since=$(jq -r 'select(.key == "issues") | .since' "$TMP/listing-pages.jsonl")
+  [ -n "$issue_since" ] || return 1
   jq -r -n --slurpfile c "$TMP/comments.json" --slurpfile r "$TMP/review.json" \
     --slurpfile i "$TMP/issues.json" --argjson page "$PER_PAGE" '
     [$c[0], $r[0], $i[0]]
     | map(select(length >= $page) | (.[-1].updated_at // empty))
     | if length == 0 then "" else min end' > "$bound" || return 1
   jq -c -n --slurpfile c "$TMP/comments.json" --slurpfile r "$TMP/review.json" \
-    --slurpfile i "$TMP/issues.json" --arg since "$since" --arg backfill "$BACKFILL_SINCE" '
+    --slurpfile i "$TMP/issues.json" --arg since "$issue_since" --arg backfill "$BACKFILL_SINCE" '
     def norm($kind; $prefix):
       map(select((.user.login | type) == "string" and (.body | type) == "string"
           and (.html_url | type) == "string" and (.id | type) == "number")
@@ -480,6 +498,15 @@ read_repo() {  # <owner/name> <since-iso> <candidates-out> <cursor-bound-out>
       + ($i[0]
          | map(select((.created_at | type) == "string" and .created_at >= $floor))
          | norm("body"; "issue-")))[]' > "$out"
+}
+
+advance_listings() {  # <cursor-json> <repo> <aggregate-bound> <out>
+  jq -s --arg r "$2" --arg overlap "$OVERLAP_SINCE" '
+    map({key:.key,value:(if .full then {since:.since,page:(.page + 1)}
+      else {since:$overlap,page:1} end)}) | from_entries' "$TMP/listing-pages.jsonl" \
+    > "$TMP/listing-next.json" || return 1
+  jq --arg r "$2" --arg t "$3" --slurpfile n "$TMP/listing-next.json" \
+    '.repos[$r] = $t | .listings[$r] = $n[0]' "$1" > "$4"
 }
 
 # ---------------------------------------------------------------- grants
@@ -589,9 +616,9 @@ grant_charge() {  # <author-login> <record-id> <cursor-json> <now-iso>
     | (($spent[$id].spent_on // [])) as $funded
     | ([$trusted[] | select((.login | ascii_downcase) == $id)] | first)
     | if . == null then "absent"
+      elif ($funded | index($rec)) != null then "already-charged"
       elif (.until != null) and ((.until | fromdateiso8601) <= $t) then "lapsed"
       elif .remaining == null then "permanent"
-      elif ($funded | index($rec)) != null then "already-charged"
       elif (.remaining - ($funded | length)) <= 0 then "lapsed"
       else "bounded" end') || return 1
   case "$state" in
@@ -609,8 +636,8 @@ grant_charge() {  # <author-login> <record-id> <cursor-json> <now-iso>
 # ---------------------------------------------------------------- selection
 
 # The safety core, stated once and declaratively: a candidate survives only when
-# its own author is trusted AND its own body carries a configured marker AND
-# that body is not one firstmate wrote itself.
+# its author is currently trusted or this exact record already spent their
+# grant, its body carries a marker, and firstmate did not publish that body.
 #
 # Its own work is recognized by the stamp the body begins with, never by who
 # posted it: a home signs in as whatever account the captain gave it, and every
@@ -620,14 +647,15 @@ grant_charge() {  # <author-login> <record-id> <cursor-json> <now-iso>
 # @captain's call would be a fresh mention. The stamp counts only at the START
 # of a body, so quoting an earlier one and adding a real request is still a
 # request - which is the common case on a thread firstmate is already on.
-qualify() {  # <candidates-in> <repo> <qualified-out>
+qualify() {  # <candidates-in> <repo> <cursor-json> <qualified-out>
   jq -c --arg repo "$2" --argjson trusted "$LIVE_LOGINS_JSON" \
     --argjson markers "$CFG_MARKERS_JSON" --argjson cap "$BODY_MAX" \
-    --arg stamp "$PUBLISH_STAMP" '
+    --arg stamp "$PUBLISH_STAMP" --slurpfile cursor "$3" '
     . as $c
     | select(($c.body | sub("^[[:space:]]+"; "") | startswith($stamp)) | not)
     | ($c.author | ascii_downcase) as $login
-    | select(any($trusted[]; . == $login))
+    | select(any($trusted[]; . == $login)
+        or ((($cursor[0].grants[$login].spent_on // []) | index($c.record_id)) != null))
     | [$markers[] as $m | select(($c.body | ascii_downcase) | contains($m | ascii_downcase)) | $m] as $hit
     | select(($hit | length) > 0)
     | ($c.comment_url | split("#")[0]) as $subject
@@ -635,7 +663,7 @@ qualify() {  # <candidates-in> <repo> <qualified-out>
     | $c + {marker: $hit[0], repository: $repo, subject_url: $subject,
             subject_type: (if $seg[-2] == "pull" then "pull" else "issue" end),
             subject_number: (($seg[-1] | tonumber?) // 0),
-            body: ($c.body[:$cap])}' "$1" > "$3"
+            body: ($c.body[:$cap])}' "$1" > "$4"
 }
 
 # ---------------------------------------------------------------- records
@@ -710,11 +738,9 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
   local repo=$1 state_json=$2 start=$3 out=$4 since line id advance charge unfiled=0
   since=$(jq -r --arg r "$repo" --arg b "$BACKFILL_SINCE" '.repos[$r] // $b' "$state_json")
   cp "$state_json" "$out" || return 1
-  # Stamped before the first read can fail, so a repo that never reads cleanly
-  # still rotates to the back of the order instead of holding a slot forever.
   jq --arg r "$repo" --arg t "$start" '.attempted[$r] = $t' "$out" > "$TMP/attempt.json" \
     && mv -f -- "$TMP/attempt.json" "$out"
-  if ! read_repo "$repo" "$since" "$TMP/candidates.jsonl" "$TMP/bound"; then
+  if ! read_repo "$repo" "$since" "$state_json" "$TMP/candidates.jsonl" "$TMP/bound"; then
     if [ "$RATE_LIMITED" -eq 1 ]; then
       diag "$POLL_SCOPE" "GitHub refused this host's API allowance, so this cycle stopped at the refused call; every gh-backed plane on this host is affected until the allowance resets"
     elif [ "$BUDGET_EXHAUSTED" -eq 0 ]; then
@@ -722,10 +748,8 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
     fi
     return 1
   fi
-  # The reads completed, so whatever was reported for this repo before was
-  # either found again above or is genuinely gone.
   diag_evaluated "$repo"
-  if ! qualify "$TMP/candidates.jsonl" "$repo" "$TMP/qualified.jsonl"; then
+  if ! qualify "$TMP/candidates.jsonl" "$repo" "$out" "$TMP/qualified.jsonl"; then
     diag "$repo" "could not read $repo's new activity; it is retried next cycle"
     return 1
   fi
@@ -766,7 +790,7 @@ poll_repo() {  # <owner/name> <cursor-json> <poll-start-iso> <new-cursor-out>
   # of stepping over what the page cut off.
   advance=$(cat "$TMP/bound")
   [ -n "$advance" ] || advance=$OVERLAP_SINCE
-  jq --arg r "$repo" --arg t "$advance" '.repos[$r] = $t' "$out" > "$TMP/next.json" \
+  advance_listings "$out" "$repo" "$advance" "$TMP/next.json" \
     && mv -f -- "$TMP/next.json" "$out"
 }
 
