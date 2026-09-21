@@ -1,0 +1,9 @@
+{
+  "scenario": "untrusted tagged GitHub body is ignored",
+  "source": "https://github.com/davidkydd/firstmate/pull/4",
+  "actual_author": "davidkydd",
+  "configured_trusted_login": "mengsig",
+  "poll_output": "",
+  "pending_records": 0,
+  "queued_wakes": 0
+}

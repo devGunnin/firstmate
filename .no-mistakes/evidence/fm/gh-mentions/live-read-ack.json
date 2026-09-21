@@ -1,0 +1,13 @@
+{
+  "scenario": "accepted GitHub mention can be acknowledged into handled state",
+  "handled_record": {
+    "schema": "fm-gh-mention.v1",
+    "record_id": "issue-5528492631",
+    "repository": "davidkydd/firstmate",
+    "subject_type": "pull",
+    "subject_number": 4,
+    "author": "davidkydd",
+    "marker": "@firstmate"
+  },
+  "pending_after_ack": []
+}

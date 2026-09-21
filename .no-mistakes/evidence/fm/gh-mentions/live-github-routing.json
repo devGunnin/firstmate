@@ -1,0 +1,23 @@
+{
+  "scenario": "trusted public GitHub PR body is durably routed exactly once",
+  "product_output": "gh-mention: davidkydd tagged @firstmate on https://github.com/davidkydd/firstmate/pull/4 (record issue-5528492631)",
+  "record": {
+    "schema": "fm-gh-mention.v1",
+    "record_id": "issue-5528492631",
+    "comment_kind": "body",
+    "comment_id": 5528492631,
+    "comment_url": "https://github.com/davidkydd/firstmate/pull/4",
+    "author": "davidkydd",
+    "marker": "@firstmate",
+    "repository": "davidkydd/firstmate",
+    "subject_type": "pull",
+    "subject_number": 4,
+    "accepted_at": "2026-09-21T16:37:14Z"
+  },
+  "wake": "1790008636\t1\tcheck\tgh-mention:issue-5528492631\tcheck: gh-mention issue-5528492631\n",
+  "processed": [
+    "issue-5528492631"
+  ],
+  "second_poll_output": "",
+  "status_after": "gh mentions: on\nauthorized logins:\n  davidkydd - permanent\nmarkers: @firstmate,@captain\npublish stamp: <!-- firstmate:gh-mention -->\nwatched repositories:\n  davidkydd/firstmate\npending mentions: 1\narmed: no"
+}
