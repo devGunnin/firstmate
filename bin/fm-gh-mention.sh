@@ -44,10 +44,11 @@
 #   repos/<o>/<r>/issues/comments  issue and PR conversation comments
 #   repos/<o>/<r>/pulls/comments   PR review comments
 #   repos/<o>/<r>/issues           bodies of threads OPENED in the window read
-# Full listings are paged to completion inside one poll. An interrupted listing
-# keeps its durable cursor, so the next poll rescans from page one and processed
-# record identities make that overlap harmless. GitHub filters all three by
-# `since` on updated_at, and a thread's updated_at
+# Full listings are paged until two complete passes return the same identities
+# and timestamps. An interrupted or changing listing keeps its durable cursor,
+# so the next poll rescans from page one and processed record identities make
+# that overlap harmless. GitHub filters all three by `since` on updated_at, and
+# a thread's updated_at
 # moves on ANY activity - a new comment, a label, a reopen. For a comment that
 # is what is wanted, because only editing THAT comment moves its own stamp. For
 # a body it is not: an issue tagged months ago and bumped today would be filed
@@ -75,9 +76,9 @@
 # from the read cursor, which a repo whose reads do not all complete keeps, so
 # nothing is skipped. The cap bounds repositories attempted per sweep. A
 # one-page repository costs three calls; an active repository may use more
-# while paging, within the poll's time budget. A larger watched set buys a
-# longer worst-case pickup rather than unbounded repository fan-out shared with
-# every other gh-backed plane on this host.
+# while paging, within the poll's time budget. A larger or busier watched set
+# can increase pickup time rather than causing unbounded repository fan-out
+# shared with every other gh-backed plane on this host.
 #
 # DURABLE STATE (all under state/, all gitignored):
 #   gh-mention-inbox/<record-id>.json          one accepted mention, pending
@@ -119,8 +120,9 @@
 # state/ is writable again.
 #
 # RESPONSE LATENCY. An enabled plane asks the home's watcher for a 30s sweep
-# instead of the default 300, so a tagged comment is picked up in tens of
-# seconds. That request goes through the one
+# instead of the default 300, so a one-page repo reached in that sweep can be
+# picked up in tens of seconds; pagination and later repos can take longer.
+# That request goes through the one
 # cadence config/x-mode.env that bin/fm-bootstrap.sh already owns for Relay: a
 # home running both planes gets one interval, the fastest either asked for,
 # never two. A tight cadence is affordable because each capped repo starts with
@@ -455,23 +457,48 @@ listing_since() {  # <cursor-json> <repo> <listing> <default-since>
     '.listings[$r][$k].since // $s' "$1"
 }
 
-read_listing() {  # <repo> <listing> <api-path> <default-since> <cursor-json> <out>
-  local repo=$1 key=$2 api=$3 fallback=$4 state_json=$5 out=$6 since page=1 q count
-  since=$(listing_since "$state_json" "$repo" "$key" "$fallback") || return 1
+LISTING_WAS_PAGED=0
+read_listing_pass() {  # <repo> <listing> <api-path> <since> <out>
+  local repo=$1 key=$2 api=$3 since=$4 out=$5 page=1 q count
   [ -n "$since" ] || return 1
   : > "$TMP/listing-items.jsonl"
+  LISTING_WAS_PAGED=0
   while :; do
     q="per_page=$PER_PAGE&sort=updated&direction=asc&since=$since&page=$page"
     [ "$key" != issues ] || q="state=all&$q"
     forge "repos/$repo/$api?$q" "$TMP/listing-page.json" || return 1
-    jq -e 'all(.[]; (.updated_at | type) == "string")' "$TMP/listing-page.json" >/dev/null \
+    jq -e 'all(.[]; (.id | type) == "number" and (.updated_at | type) == "string")' \
+      "$TMP/listing-page.json" >/dev/null \
       || return 1
     count=$(jq 'length' "$TMP/listing-page.json") || return 1
     jq -c '.[]' "$TMP/listing-page.json" >> "$TMP/listing-items.jsonl" || return 1
     [ "$count" -ge "$PER_PAGE" ] || break
+    LISTING_WAS_PAGED=1
     page=$((page + 1))
   done
   jq -s '.' "$TMP/listing-items.jsonl" > "$out" || return 1
+}
+
+listing_fingerprint() {  # <listing-json>
+  jq -c 'map([.id,.updated_at]) | sort | unique' "$1"
+}
+
+read_listing() {  # <repo> <listing> <api-path> <default-since> <cursor-json> <out>
+  local repo=$1 key=$2 api=$3 fallback=$4 state_json=$5 out=$6 since current next
+  since=$(listing_since "$state_json" "$repo" "$key" "$fallback") || return 1
+  read_listing_pass "$repo" "$key" "$api" "$since" "$TMP/listing-current.json" || return 1
+  if [ "$LISTING_WAS_PAGED" -eq 0 ]; then
+    mv -f -- "$TMP/listing-current.json" "$out" || return 1
+  else
+    current=$(listing_fingerprint "$TMP/listing-current.json") || return 1
+    while :; do
+      read_listing_pass "$repo" "$key" "$api" "$since" "$TMP/listing-rescan.json" || return 1
+      next=$(listing_fingerprint "$TMP/listing-rescan.json") || return 1
+      [ "$current" != "$next" ] || break
+      current=$next
+    done
+    mv -f -- "$TMP/listing-rescan.json" "$out" || return 1
+  fi
   jq -n --arg k "$key" --arg s "$OVERLAP_SINCE" '{key:$k,since:$s}' \
     >> "$TMP/listing-next.jsonl"
 }

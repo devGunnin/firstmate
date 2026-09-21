@@ -45,10 +45,16 @@ fi
 [ -f "$FM_TEST_GH_DIR/fail" ] && exit 1
 page=$(printf '%s\n' "$query" | tr '&' '\n' | sed -n 's/^page=//p')
 page=${page:-1}
+count_file="$FM_TEST_GH_DIR/$repo.$kind.page-$page.count"
+count=$(cat "$count_file" 2>/dev/null || printf '0\n')
+count=$((count + 1))
+printf '%s\n' "$count" > "$count_file"
 if [ -f "$FM_TEST_GH_DIR/$repo.$kind.fail-page-$page" ]; then
   exit 1
 fi
-if [ -f "$FM_TEST_GH_DIR/$repo.$kind.page-$page.json" ]; then
+if [ -f "$FM_TEST_GH_DIR/$repo.$kind.page-$page.call-$count.json" ]; then
+  cat "$FM_TEST_GH_DIR/$repo.$kind.page-$page.call-$count.json"
+elif [ -f "$FM_TEST_GH_DIR/$repo.$kind.page-$page.json" ]; then
   cat "$FM_TEST_GH_DIR/$repo.$kind.page-$page.json"
 elif [ "$page" = 1 ] && [ -f "$FM_TEST_GH_DIR/$repo.$kind.json" ]; then
   cat "$FM_TEST_GH_DIR/$repo.$kind.json"
@@ -76,6 +82,12 @@ canned() {
 canned_page() {
   local home=$1 repo=$2 kind=$3 page=$4 json=$5
   printf '%s\n' "$json" > "$home/gh/${repo%/*}__${repo#*/}.$kind.page-$page.json"
+}
+
+canned_call() {
+  local home=$1 repo=$2 kind=$3 page=$4 call=$5 json=$6
+  printf '%s\n' "$json" \
+    > "$home/gh/${repo%/*}__${repo#*/}.$kind.page-$page.call-$call.json"
 }
 
 # comment <id> <login> <body> <html-url> [created-at]: one listing entry in
@@ -883,8 +895,8 @@ test_a_full_listing_is_exhausted_before_the_cursor_advances() {
   cursor=$(jq -r '.repos["o/busy"]' "$home/state/gh-mention-cursor.json")
   assert_equals "$cursor" "$(jq -r '.listings["o/busy"].comments.since' \
     "$home/state/gh-mention-cursor.json")" "a completed listing advances its timestamp cursor"
-  assert_equals 2 "$(grep -c '^repos/o/busy/issues/comments$' "$home/gh/paths.log")" \
-    "a full first page is followed through its empty second page"
+  assert_equals 4 "$(grep -c '^repos/o/busy/issues/comments$' "$home/gh/paths.log")" \
+    "a full listing is traversed twice before its cursor advances"
   pass "fm-gh-mention: a full listing is exhausted before its cursor advances"
 }
 
@@ -943,6 +955,36 @@ test_a_reordered_listing_restarts_before_advancing() {
     "a tagged item shifted onto page one is filed after the traversal restarts"
   assert_equals 1 "$(wakes_in "$home")" "the shifted request queues exactly one wake"
   pass "fm-gh-mention: a reordered listing restarts before cursor advancement"
+}
+
+test_a_listing_reordered_between_pages_is_rescanned() {
+  local home first shifted tail tagged
+  home=$(make_home reorder-within '{"enabled":true,"trusted_logins":["mengsig"],"repos":["o/busy"]}')
+  first=$(jq -nc '[range(100) | {id:(1000 + .),user:{login:"someone-else"},body:"routine",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-\(1000 + .)",
+    updated_at:"2026-09-19T09:00:00Z"}]')
+  tagged=$(jq -nc '{id:1100,user:{login:"mengsig"},body:"@firstmate shifted request",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-1100",
+    updated_at:"2026-09-19T09:00:00Z"}')
+  shifted=$(jq -nc --argjson tagged "$tagged" '[range(1;100) | {id:(1000 + .),
+    user:{login:"someone-else"},body:"routine",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-\(1000 + .)",
+    updated_at:"2026-09-19T09:00:00Z"}] + [$tagged]')
+  tail=$(jq -nc '[{id:1000,user:{login:"someone-else"},body:"edited",
+    html_url:"https://github.com/o/busy/issues/1#issuecomment-1000",
+    updated_at:"2026-09-20T09:00:00Z"}]')
+  canned_page "$home" o/busy comments 1 "$shifted"
+  canned_page "$home" o/busy comments 2 "$tail"
+  canned_call "$home" o/busy comments 1 1 "$first"
+
+  run_plane "$home" poll >/dev/null 2>&1
+
+  assert_present "$home/state/gh-mention-inbox/comment-1100.json" \
+    "a tagged item shifted onto an already-read page is recovered by the rescan"
+  assert_equals 1 "$(wakes_in "$home")" "the intra-traversal shift queues exactly one wake"
+  assert_equals 6 "$(grep -c '^repos/o/busy/issues/comments$' "$home/gh/paths.log")" \
+    "the changed identity boundary is traversed again until stable"
+  pass "fm-gh-mention: an intra-traversal reorder is rescanned before cursor advancement"
 }
 
 test_a_failed_read_keeps_the_repo_cursor() {
@@ -1147,6 +1189,7 @@ test_the_plane_requests_a_fast_watcher_cadence
 test_a_full_listing_is_exhausted_before_the_cursor_advances
 test_a_full_page_timestamp_tie_is_exhausted_in_one_poll
 test_a_reordered_listing_restarts_before_advancing
+test_a_listing_reordered_between_pages_is_rescanned
 test_a_failed_read_keeps_the_repo_cursor
 test_a_persistent_failure_is_reported_once
 test_a_standing_failure_survives_the_sweep_rotation
